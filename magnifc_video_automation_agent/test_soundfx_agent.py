@@ -33,6 +33,7 @@ def test_create_soundfx(tmp_path):
                         "narration": "Raja enters.",
                     }
                 ],
+                "scene_timings": [{"scene_number": 1, "start_seconds": 0.0, "end_seconds": 3.5}],
             }
         )
     finally:
@@ -42,7 +43,7 @@ def test_create_soundfx(tmp_path):
     sfx_file = Path(result["sfx_files"][0])
     assert sfx_file.exists()
     assert sfx_file.read_bytes() == b"fake sfx"
-    assert calls[0]["duration_seconds"] == 12
+    assert calls[0]["duration_seconds"] == 3.5
     assert "A glowing forest" in calls[0]["text"]
 
 
