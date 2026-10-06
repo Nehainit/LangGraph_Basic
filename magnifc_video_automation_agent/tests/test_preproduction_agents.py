@@ -1,7 +1,19 @@
 import json
 
+import pytest
+
 from video_automation.agents import preproduction_agents
 from video_automation.continuity_context import character_definitions
+
+
+@pytest.fixture(autouse=True)
+def enable_llm_reviewers(monkeypatch):
+    # Most tests here exercise the reviewer paths; the fast-path defaults are tested explicitly.
+    planning = preproduction_agents.PIPELINE_CONFIG["planning"]
+    monkeypatch.setitem(planning, "narration_semantic_review", True)
+    monkeypatch.setitem(planning, "director_critic", True)
+    monkeypatch.setitem(planning, "visual_beats_mode", "llm")
+    monkeypatch.setitem(preproduction_agents.SCENE_PLANNING_CONFIG["story_faithfulness"], "semantic_review_enabled", True)
 
 
 NARRATION = "Raja leaves the village, crosses the forest, and finally returns home safely."
@@ -418,6 +430,31 @@ def test_narration_regenerates_when_text_is_not_supported_by_parent_beat(monkeyp
     ]
 
 
+def test_hindi_narration_retries_english_text(monkeypatch):
+    prompts = []
+    responses = iter([
+        {"narration_segments": [{"text": "The king meets a mouse."}], "needs_story_revision": False, "revision_reason": None},
+        {"narration_segments": [{"text": "राजा एक चूहे से मिलता है।"}], "needs_story_revision": False, "revision_reason": None},
+        {"approved": True, "issues": []},
+    ])
+
+    class NarrationModel:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return type("Response", (), {"content": json.dumps(next(responses), ensure_ascii=False)})()
+
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: NarrationModel())
+    result = preproduction_agents.create_narration_script({
+        "duration": "10 seconds", "language": "Hindi",
+        "story_outline": {"structure": [{"beat_id": "beat-001", "description": "राजा एक चूहे से मिलता है।"}]},
+        "parsed_requirements": {"duration_seconds": 10, "language": "English"},
+    })
+
+    assert result["narration_script"] == "राजा एक चूहे से मिलता है।"
+    assert "Hindi in Devanagari" in prompts[0][1]["content"]
+    assert "Hindi in Devanagari" in prompts[1][1]["content"]
+
+
 def test_scene_planner_normalizes_timing_then_checks_faithfulness(monkeypatch):
     monkeypatch.setitem(
         preproduction_agents.SCENE_PLANNING_CONFIG["scene_boundaries"],
@@ -710,6 +747,54 @@ def test_narration_leaves_estimated_length_to_tts_timing(monkeypatch):
     assert [item["purpose"] for item in result["llm_evaluations"]] == [
         "generate_narration_script", "review_narration_traceability"
     ]
+
+
+def test_narration_timing_feedback_enforces_shorter_word_limit(monkeypatch):
+    prompts = []
+    responses = iter([
+        {"narration_segments": [{"text": "Raja walks through the forest slowly."}], "needs_story_revision": False, "revision_reason": None},
+        {"narration_segments": [{"text": "Raja walks home."}], "needs_story_revision": False, "revision_reason": None},
+        {"approved": True, "issues": []},
+    ])
+
+    class NarrationModel:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return type("Response", (), {"content": json.dumps(next(responses))})()
+
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: NarrationModel())
+    result = preproduction_agents.create_narration_script({
+        "duration": "10 seconds", "language": "English",
+        "story_outline": {"structure": [{"beat_id": "beat-001", "description": "Raja returns home."}]},
+        "narration_feedback": "Shorten the narration.", "narration_target_words": 3,
+    })
+
+    assert result["narration_script"] == "Raja walks home."
+    assert "at most 3 words" in prompts[0][1]["content"]
+    assert len(prompts) == 3
+
+
+def test_narration_timing_feedback_keeps_shortest_valid_draft(monkeypatch):
+    responses = iter([
+        {"narration_segments": [{"text": "Raja walks through the forest and returns home."}], "needs_story_revision": False, "revision_reason": None},
+        {"narration_segments": [{"text": "Raja walks back home."}], "needs_story_revision": False, "revision_reason": None},
+        {"narration_segments": [{"text": "Raja finally walks back home."}], "needs_story_revision": False, "revision_reason": None},
+    ])
+
+    class NarrationModel:
+        def invoke(self, _prompt):
+            return type("Response", (), {"content": json.dumps(next(responses))})()
+
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: NarrationModel())
+    result = preproduction_agents.create_narration_script({
+        "duration": "10 seconds", "language": "English",
+        "story_outline": {"structure": [{"beat_id": "beat-001", "description": "Raja returns home."}]},
+        "narration_feedback": "Shorten the narration.", "narration_target_words": 3,
+    })
+
+    assert result["narration_script"] == "Raja walks back home."
+    assert result["narration_feedback"] == ""
+    assert "Narration review warning" in result["warnings"][-1]
 
 
 def test_narration_retries_segment_count_and_derives_traceability(monkeypatch):
@@ -1084,3 +1169,116 @@ def test_shot_completion_derives_missing_continuity_from_visual_beats():
 
     assert completed["continuity_in"] == "Raja waits at the forest entrance."
     assert completed["continuity_out"] == "Raja steps into the forest."
+
+
+def test_shot_plan_adds_characters_named_in_visible_action():
+    state = {
+        "scenes": [{
+            "scene_id": "scene-001", "location_id": "location-001", "start_sec": 0.0, "end_sec": 5.0,
+            "characters_present": ["raja_001", "chuha_001"],
+        }],
+        "visual_beats": [{"visual_beat_id": "vb-001", "scene_id": "scene-001", "source_segment_ids": ["segment-001"]}],
+        "narration_segments": [{"segment_id": "segment-001", "text": "Raja meets Chuha."}],
+        "production_bible": {"characters": [
+            {"character_id": "raja_001", "name": "Raja"},
+            {"character_id": "chuha_001", "name": "Chuha"},
+        ]},
+    }
+    planned = planned_shot(
+        "scene-001", "vb-001", ["segment-001"], "location-001", 5, "Chuha waves while Raja watches.", "Meet.",
+    )
+
+    shots = preproduction_agents._validate_shot_plan(
+        {"needs_revision": False, "revision_reason": None, "shots": [planned]}, state,
+    )
+
+    assert shots[0]["characters_present"] == ["raja_001", "chuha_001"]
+
+
+def test_visual_beats_are_derived_from_scene_actions_without_a_model_call(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["planning"], "visual_beats_mode", "derive_from_scenes")
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: pytest.fail("model called"))
+    actions = ["Raja finds a mango.", "Raja shares the mango with Chuha."]
+
+    result = preproduction_agents.create_visual_beats({
+        "story_outline": {"structure": [{"beat_id": "beat-001"}, {"beat_id": "beat-002"}]},
+        "narration_segments": [
+            {"segment_id": "segment-001", "parent_beat_ids": ["beat-001"], "text": "Raja finds a mango."},
+            {"segment_id": "segment-002", "parent_beat_ids": ["beat-002"], "text": "He shares it."},
+        ],
+        "scenes": [{
+            "scene_id": "scene-001", "source_segment_ids": ["segment-001", "segment-002"],
+            "visible_actions": actions, "emotion": "warm", "scene_goal": "Share the mango.",
+            "story_purpose": "Show friendship.",
+        }],
+    })
+
+    assert result["visual_plan_needs_revision"] is False
+    assert [beat["visual_action"] for beat in result["visual_beats"]] == actions
+    assert [beat["source_segment_ids"] for beat in result["visual_beats"]] == [["segment-001"], ["segment-002"]]
+    assert result["visual_beats"][1]["continuity_in"] == "Continues from: Raja finds a mango."
+
+
+def test_director_critic_is_skipped_by_default(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["planning"], "director_critic", False)
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: pytest.fail("model called"))
+
+    result = preproduction_agents.critique_shots({"director_plan": [], "storyboard": []})
+
+    assert result["director_approved"] is True and "llm_evaluations" not in result
+
+
+def test_shot_grammar_repairs_repeats_and_rejects_only_unrepairable_ones():
+    def grammar_shot(number, action, framing="medium", scene_id="scene-001"):
+        return {"shot_id": f"shot-{number:03}", "scene_id": scene_id, "visual_beat_ids": [f"vb-{number:03}"],
+                "visual_action": action, "visual_focus": action, "framing": framing, "camera_angle": "eye_level"}
+
+    beats = {"vb-002": {"visual_action": "Faces and reactions as Cuha points.", "visual_focus": "reaction"}}
+    repaired = preproduction_agents._apply_shot_grammar(
+        [grammar_shot(1, "Cuha points at the art."), grammar_shot(2, "Cuha points at the art!")], beats,
+    )
+    assert repaired[1]["visual_action"] == "Faces and reactions as Cuha points."
+    assert repaired[1]["framing"] == "close_up"
+
+    with pytest.raises(RuntimeError, match="shot-002 repeats the visual action of shot-001"):
+        preproduction_agents._apply_shot_grammar(
+            [grammar_shot(1, "Raja waves."), grammar_shot(2, "Raja waves.")],
+            {"vb-002": {"visual_action": "Raja waves."}},
+        )
+    across_scenes = preproduction_agents._apply_shot_grammar(
+        [grammar_shot(1, "Raja waves."), grammar_shot(2, "Raja smiles.", scene_id="scene-002")], {},
+    )
+    assert [shot["framing"] for shot in across_scenes] == ["medium", "medium"]
+
+
+def test_long_scenes_get_reaction_and_detail_coverage(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["planning"], "visual_beats_mode", "derive_from_scenes")
+    result = preproduction_agents.create_visual_beats({
+        "story_outline": {"structure": [{"beat_id": "beat-001"}]},
+        "narration_segments": [{"segment_id": "segment-001", "parent_beat_ids": ["beat-001"], "text": "Sher enters."}],
+        "scenes": [{
+            "scene_id": "scene-001", "source_segment_ids": ["segment-001"], "start_sec": 0.0, "end_sec": 10.0,
+            "visible_actions": ["Sher enters the cave."], "emotion": "calm", "scene_goal": "Rest.",
+        }],
+    })
+
+    assert [beat["visual_action"] for beat in result["visual_beats"]] == [
+        "Sher enters the cave.", "Faces and reactions as Sher enters the cave",
+    ]
+
+def test_copied_prompt_placeholders_are_replaced_from_the_approved_beat():
+    shot = {
+        "shot_id": "shot-001", "scene_id": "scene-001", "visual_beat_ids": ["vb-001"], "framing": "medium",
+        "camera_angle": "eye_level", "visual_action": "One visible frozen action.", "visual_focus": "Sher",
+        "composition": "Sher sits at the cave mouth.", "continuity_out": "Relevant state leaving the shot.",
+    }
+    beat = {"visual_action": "Sher enters the cave.", "continuity_out": "Leads into: Cuha approaches."}
+
+    repaired = preproduction_agents._apply_shot_grammar([shot], {"vb-001": beat})[0]
+
+    assert repaired["visual_action"] == "Sher enters the cave."
+    assert repaired["continuity_out"] == "Leads into: Cuha approaches."
+    with pytest.raises(RuntimeError, match="copied the example composition"):
+        preproduction_agents._apply_shot_grammar(
+            [{**shot, "composition": "Concrete placement of subjects and relevant environment."}], {"vb-001": beat},
+        )

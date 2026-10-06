@@ -5,10 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from video_automation.artifact_store import public_artifact_url
+from video_automation.cost_control import is_permanent_error, ledger_for, take_paid_redo
 from video_automation.agents.editor_agent import _clip, _resolution
-from video_automation.agents.image_agent import _generate_scene_video_file, _out_dir
+from video_automation.agents.image_agent import _env, _generate_scene_video_file, _out_dir
 from video_automation.prompts import SHOT_VIDEO_GENERATION_CONFIG
 from video_automation.schema import AgentState
+from video_automation.model_catalog import selected_model
+
+
+def _video_provider(state: AgentState) -> str:
+    return "fal" if selected_model(state, "video")["provider"] == "fal.ai" else "magnific"
 
 
 def _failure_type(error: str) -> str:
@@ -25,7 +31,9 @@ def _record(state: AgentState, shot: dict, image_file: str | None, requested: fl
         "video_file": video_file,
         "requested_duration_seconds": requested,
         "generated_duration_seconds": generated if video_file else None,
-        "model_used": SHOT_VIDEO_GENERATION_CONFIG["model_used"],
+        "provider": _video_provider(state),
+        "model_used": selected_model(state, "video")["id"],
+        "selected_model_id": selected_model(state, "video")["id"],
         "aspect_ratio": state.get("aspect_ratio", SHOT_VIDEO_GENERATION_CONFIG["default_aspect_ratio"]),
         "video_quality": state.get("video_quality", "standard"),
         "generation_attempt": attempt,
@@ -34,12 +42,14 @@ def _record(state: AgentState, shot: dict, image_file: str | None, requested: fl
     }
 
 
-def _worker_count(job_count: int) -> int:
+def _worker_count(job_count: int, provider: str) -> int:
+    default = 5 if provider == "fal" else 3
+    limit = 5 if provider == "fal" else 4
     try:
-        configured = int(os.getenv("VIDEO_GENERATION_WORKERS", "3"))
+        configured = int(os.getenv("VIDEO_GENERATION_WORKERS", str(default)))
     except ValueError:
-        configured = 3
-    return min(job_count, max(1, min(4, configured)))
+        configured = default
+    return min(job_count, max(1, min(limit, configured)))
 
 
 def _fallback_motion(plan: dict) -> str:
@@ -86,6 +96,9 @@ def _generate_job(args: tuple) -> tuple[dict, dict | None, str | None]:
             break
         except Exception as exc:
             result, error = None, str(exc)
+            if is_permanent_error(exc):
+                # Content-policy, invalid-request, and budget failures repeat on every attempt.
+                break
     requested = float(plan["duration_seconds"])
     warning = None
     generated_duration = float(provider_duration)
@@ -99,6 +112,7 @@ def _generate_job(args: tuple) -> tuple[dict, dict | None, str | None]:
             error = f"{error}; FFmpeg fallback failed: {fallback_exc}"
     item = _record(state, shot, image_file, requested, generated_duration, attempt, result, None if result else error)
     if result and warning:
+        item["provider"] = "ffmpeg"
         item["model_used"] = "ffmpeg"
     candidate = None
     if state.get("quality_mode") == "refine":
@@ -107,6 +121,7 @@ def _generate_job(args: tuple) -> tuple[dict, dict | None, str | None]:
             "prompt": plan["video_prompt"], "negative_prompt": plan["negative_prompt"],
             "seed": seed, "file": result, "generation_status": item["generation_status"],
             "generation_attempt": attempt, "error": item["error"],
+            "provider": item["provider"], "selected_model_id": item["selected_model_id"],
         }
     warning = warning or (None if result else f"{shot_id} video generation failed after {attempt} attempts: {error}")
     print(
@@ -123,11 +138,22 @@ def _generate(state: AgentState) -> dict:
     plans = state.get("motion_plans") or []
     if not shots or [item.get("shot_id") for item in plans] != [item.get("shot_id") for item in shots] or len(images) != len(shots):
         raise RuntimeError("Shot Video Generation needs one ordered image and motion plan per approved shot.")
+    if _video_provider(state) == "fal":
+        _env("FAL_KEY")
 
     out = _out_dir(state, "scene_videos")
     out.mkdir(parents=True, exist_ok=True)
     previous = {item["shot_id"]: item for item in state.get("generated_videos", [])}
     retry_targets = set(state.get("video_retry_shots", []))
+    if state.get("video_model"):
+        retry_targets.update(
+            shot_id for shot_id, item in previous.items()
+            if item.get("selected_model_id", item.get("model_used")) != state["video_model"]
+            or (
+                item.get("provider") in {"magnific", "fal"}
+                and item["provider"] != _video_provider(state)
+            )
+        )
     retrying = bool(previous and retry_targets)
     targets = retry_targets if retrying else {shot["shot_id"] for shot in shots}
     required_durations = {
@@ -142,6 +168,8 @@ def _generate(state: AgentState) -> dict:
     new_candidates = []
     jobs = []
     warnings = list(state.get("warnings", []))
+    redo_counts = {shot_id: dict(counts) for shot_id, counts in (state.get("paid_redo_counts") or {}).items()}
+    automatic_redos = set(state.get("video_retry_shots", []))
     allowed_durations = [int(value) for value in SHOT_VIDEO_GENERATION_CONFIG["allowed_duration_seconds"]]
     max_attempts = int(SHOT_VIDEO_GENERATION_CONFIG["max_retries"]) + 1
     requested_aspect_ratio = str(state.get("aspect_ratio", SHOT_VIDEO_GENERATION_CONFIG["default_aspect_ratio"]))
@@ -166,12 +194,19 @@ def _generate(state: AgentState) -> dict:
                     "prompt": plan["video_prompt"], "negative_prompt": plan["negative_prompt"],
                     "seed": seed, "file": None, "generation_status": "failed",
                     "generation_attempt": 0, "error": item["error"],
+                    "provider": item["provider"], "selected_model_id": item["selected_model_id"],
                 })
             continue
-        start_image_url = public_artifact_url(state, image_file) if os.getenv("MINIO_PUBLIC_ENDPOINT") and requested <= max(allowed_durations) else None
-        if not start_image_url:
+        redo_blocked = (
+            shot["shot_id"] in automatic_redos and shot["shot_id"] in previous
+            and not take_paid_redo(redo_counts, shot["shot_id"], "video")
+        )
+        start_image_url = public_artifact_url(state, image_file) if _video_provider(state) != "fal" and os.getenv("MINIO_PUBLIC_ENDPOINT") and requested <= max(allowed_durations) else None
+        if redo_blocked or (_video_provider(state) != "fal" and not start_image_url) or requested > max(allowed_durations):
             error = (
-                f"The requested {requested:g}s duration exceeds the provider maximum of {max(allowed_durations)}s."
+                "The shot already used its automatic paid video redo."
+                if redo_blocked
+                else f"The requested {requested:g}s duration exceeds the provider maximum of {max(allowed_durations)}s."
                 if requested > max(allowed_durations)
                 else "The approved source image has no provider-accessible public URL."
             )
@@ -180,6 +215,7 @@ def _generate(state: AgentState) -> dict:
                 width, height = _resolution(state)
                 _clip(str(source), requested, _fallback_motion(plan), video_file, width, height)
                 item = _record(state, shot, image_file, requested, requested, 1, str(video_file), None)
+                item["provider"] = "ffmpeg"
                 item["model_used"] = "ffmpeg"
             except Exception as exc:
                 item = _record(state, shot, image_file, requested, None, 1, None, f"{error}; FFmpeg fallback failed: {exc}")
@@ -190,9 +226,12 @@ def _generate(state: AgentState) -> dict:
                     "prompt": plan["video_prompt"], "negative_prompt": plan["negative_prompt"],
                     "seed": seed, "file": item["video_file"], "generation_status": item["generation_status"],
                     "generation_attempt": item["generation_attempt"], "error": item["error"],
+                    "provider": item["provider"], "selected_model_id": item["selected_model_id"],
                 })
             warnings.append(
-                f"{shot['shot_id']} image-to-video unavailable; used FFmpeg movement instead."
+                f"{shot['shot_id']} already used its automatic video redo; used free FFmpeg movement instead."
+                if redo_blocked and item["video_file"]
+                else f"{shot['shot_id']} image-to-video unavailable; used FFmpeg movement instead."
                 if item["video_file"] else f"{shot['shot_id']} video generation failed: {item['error']}"
             )
             continue
@@ -202,7 +241,7 @@ def _generate(state: AgentState) -> dict:
         ))
 
     if jobs:
-        workers = _worker_count(len(jobs))
+        workers = _worker_count(len(jobs), _video_provider(state))
         print(f"[pipeline:{state.get('thread_id', '-')}] VIDEO WORKERS count={workers} jobs={len(jobs)}", flush=True)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shot-video") as pool:
             for item, candidate, warning in pool.map(_generate_job, jobs):
@@ -215,6 +254,8 @@ def _generate(state: AgentState) -> dict:
     generated_videos = [generated_by_shot[shot["shot_id"]] for shot in shots]
 
     result = {
+        "cost_ledger": ledger_for(state).snapshot(),
+        "paid_redo_counts": redo_counts,
         "generated_videos": generated_videos,
         "scene_video_files": [item["video_file"] for item in generated_videos],
         "warnings": list(dict.fromkeys(warnings)),
@@ -222,7 +263,11 @@ def _generate(state: AgentState) -> dict:
     }
     if state.get("quality_mode") == "refine":
         result.update(
-            video_candidates=[*state.get("video_candidates", []), *new_candidates],
+            video_candidates=[
+                *(candidate for candidate in state.get("video_candidates", [])
+                  if not state.get("video_model") or candidate.get("selected_model_id") == state["video_model"]),
+                *new_candidates,
+            ],
         )
     return result
 

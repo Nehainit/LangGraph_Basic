@@ -14,6 +14,12 @@ shot_planning:
     - use exact character IDs in characters_present and primary_subject
     - describe one frozen action, a concrete visual focus, static framing and angle, composition, emotion, continuity in/out, and purpose
     - use a positive estimated_duration_seconds as a relative timing weight
+    - show a moment no other shot shows; never repeat another shot's visual_action
+    - list in characters_present every character named in its visual_action, visual_focus, or composition
+
+    Shot grammar: open each scene with a wide or medium-wide establishing shot of the location, then move closer
+    for actions and reactions. Consecutive shots in the same scene must differ in framing or camera angle.
+    Use close-ups for emotion and important objects.
 
     Never add plot events, characters, locations, props, conflicts, resolutions, camera movement, cuts, montages, image prompts, or animation prompts. Do not use generic phrases such as "main subject visible" or "character centered in frame".
 

@@ -2,6 +2,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from video_automation.prompts import PIPELINE_CONFIG
 from video_automation.schema import AgentState
 
 FFMPEG_TIMEOUT_SECONDS = 300
@@ -260,6 +261,60 @@ def _join_clips(clips: list[Path], scenes: list[dict], durations: list[float], o
     )
 
 
+def _audio_mix_command(state: AgentState, timings: list[dict], total_seconds: float, output: Path) -> list[str]:
+    """Mix narration over effects, ambience, and music, ducking the bed whenever narration speaks."""
+    sound = PIPELINE_CONFIG["sound"]
+    fade = float(PIPELINE_CONFIG["finishing"].get("fade_seconds") or 0)
+    inputs = ["-i", state["narration_file"]]
+    filters, bed = [], []
+
+    def add_input(path: str, loop: bool = False) -> int:
+        inputs.extend([*(["-stream_loop", "-1"] if loop else []), "-i", path])
+        return inputs.count("-i") - 1
+
+    for sfx_file, timing in zip(state.get("sfx_files") or [None] * len(timings), timings):
+        if not sfx_file:
+            continue
+        start_ms = int(float(timing["start_seconds"]) * 1000)
+        index = add_input(sfx_file)
+        filters.append(f"[{index}:a]adelay={start_ms}|{start_ms},volume=0.35[sfx{index}]")
+        bed.append(f"[sfx{index}]")
+    for track in state.get("ambience_tracks") or []:
+        duration = float(track["duration_seconds"])
+        edge = round(min(0.4, duration / 4), 3)
+        start_ms = int(float(track["start_seconds"]) * 1000)
+        # Looping covers scenes longer than one generated clip; the trim ends it at the scene boundary.
+        index = add_input(track["file"], loop=True)
+        filters.append(
+            f"[{index}:a]atrim=0:{duration},asetpts=PTS-STARTPTS,afade=t=in:d={edge},"
+            f"afade=t=out:st={max(0.0, duration - edge):.3f}:d={edge},adelay={start_ms}|{start_ms},"
+            f"volume={sound['ambience_volume']}[amb{index}]"
+        )
+        bed.append(f"[amb{index}]")
+    if state.get("music_file"):
+        index = add_input(state["music_file"])
+        filters.append(f"[{index}:a]volume={sound['music_volume']}[music]")
+        bed.append("[music]")
+
+    narration = f"[0:a]volume={sound['narration_volume']}"
+    if not bed:
+        filters.append(f"{narration}[mix]")
+    else:
+        filters.append(f"{''.join(bed)}amix=inputs={len(bed)}:duration=longest:normalize=0[bed]")
+        if sound["duck_under_narration"]:
+            filters.append(f"{narration},asplit=2[narration][key]")
+            filters.append("[bed][key]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400[ducked]")
+            filters.append("[narration][ducked]amix=inputs=2:duration=longest:normalize=0[mix]")
+        else:
+            filters.append(f"{narration}[narration]")
+            filters.append("[narration][bed]amix=inputs=2:duration=longest:normalize=0[mix]")
+    finish = f"[mix]atrim=0:{total_seconds}"
+    if fade and total_seconds > 2 * fade:
+        finish += f",afade=t=in:d={fade},afade=t=out:st={total_seconds - fade:.3f}:d={fade}"
+    filters.append(f"{finish}[a]")
+    return ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[a]", str(output)]
+
+
 def edit_video(state: AgentState) -> dict[str, str]:
     for key in ("storyboard", "image_files", "narration_file", "subtitles"):
         if not state.get(key):
@@ -321,28 +376,7 @@ def edit_video(state: AgentState) -> dict[str, str]:
         ]
         _join_clips(clips, edit_scenes, durations, picture_track)
 
-    mix_inputs = ["-i", state["narration_file"]]
-    filter_parts = []
-    labels = ["[0:a]"]
-    audio_index = 1
-    for scene, sfx_file, timing in zip(state["storyboard"], state.get("sfx_files") or [None] * len(timings), timings):
-        if not sfx_file:
-            continue
-        start_ms = int(float(timing["start_seconds"]) * 1000)
-        mix_inputs.extend(["-i", sfx_file])
-        filter_parts.append(f"[{audio_index}:a]adelay={start_ms}|{start_ms},volume=0.35[sfx{audio_index}]")
-        labels.append(f"[sfx{audio_index}]")
-        audio_index += 1
-    if state.get("music_file"):
-        mix_inputs.extend(["-i", state["music_file"]])
-        music_index = len(mix_inputs) // 2 - 1
-        filter_parts.append(f"[{music_index}:a]volume=0.16[music]")
-        labels.append("[music]")
-    filter_parts.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:dropout_transition=0[a]")
-
-    _run_ffmpeg(
-        ["ffmpeg", "-y", *mix_inputs, "-filter_complex", ";".join(filter_parts), "-map", "[a]", str(mixed_audio_file)]
-    )
+    _run_ffmpeg(_audio_mix_command(state, timings, total_seconds, mixed_audio_file))
     overlays = _caption_overlays(state, out)
     final_command = [
         "ffmpeg",
@@ -355,23 +389,24 @@ def edit_video(state: AgentState) -> dict[str, str]:
     for caption_file, _, _ in overlays:
         final_command.extend(["-loop", "1", "-i", str(caption_file)])
 
-    if overlays:
-        current = "[0:v]"
-        filters = []
-        for index, (_, start, end) in enumerate(overlays, start=2):
-            output = f"[v{index}]"
-            filters.append(f"{current}[{index}:v]overlay=0:0:enable='between(t,{start},{end})'{output}")
-            current = output
-        final_command.extend(
-            [
-                "-filter_complex",
-                ";".join(filters),
-                "-map",
-                current,
-                "-map",
-                "1:a:0",
-            ]
-        )
+    finishing = PIPELINE_CONFIG["finishing"]
+    grade = str(finishing.get("color_grade") or "").strip()
+    fade = float(finishing.get("fade_seconds") or 0)
+    current = "[0:v]"
+    filters = []
+    if grade:
+        # One grade over the whole picture, applied before captions so text keeps its colours.
+        filters.append(f"{current}{grade}[graded]")
+        current = "[graded]"
+    for index, (_, start, end) in enumerate(overlays, start=2):
+        output = f"[v{index}]"
+        filters.append(f"{current}[{index}:v]overlay=0:0:enable='between(t,{start},{end})'{output}")
+        current = output
+    if fade and total_seconds > 2 * fade:
+        filters.append(f"{current}fade=t=in:st=0:d={fade},fade=t=out:st={total_seconds - fade:.3f}:d={fade}[faded]")
+        current = "[faded]"
+    if filters:
+        final_command.extend(["-filter_complex", ";".join(filters), "-map", current, "-map", "1:a:0"])
     else:
         final_command.extend(["-map", "0:v:0", "-map", "1:a:0"])
 

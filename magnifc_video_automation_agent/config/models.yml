@@ -1,0 +1,34 @@
+version: 1
+
+# Used when MODEL_PROVIDER=auto. Every stage tries its chain in order and moves to the next entry
+# when a provider is rate limited, overloaded, unreachable, or returns an error. Entries whose
+# provider has no API key configured are skipped, so the chain works with whichever keys you have.
+# A provider that returns a rate limit or overload is skipped for cooldown_seconds by every stage.
+# usd_per_1m_input/usd_per_1m_output price paid entries for the per-video budget; free tiers omit them.
+routing:
+  cooldown_seconds: 60
+
+  chains:
+    # Planning, story, narration, and other text stages.
+    # gpt-5-nano (prepaid, about 1-2 cents per video) handles every stage; free tiers back it up.
+    text:
+      - {provider: openai, model: gpt-5-nano, usd_per_1m_input: 0.05, usd_per_1m_output: 0.40}
+      - {provider: groq, model: openai/gpt-oss-120b}
+      - {provider: gemini, model: gemini-3.6-flash}
+      - {provider: gemini, model: gemini-3.5-flash-lite}
+      - {provider: gemini, model: gemma-4-26b-a4b-it}
+      - {provider: ollama, model: qwen2.5:3b-instruct}
+    # Stages that look at images. Groq's free tier has no vision model, so it is not listed.
+    vision:
+      - {provider: openai, model: gpt-5-nano, usd_per_1m_input: 0.05, usd_per_1m_output: 0.40}
+      - {provider: gemini, model: gemini-3.6-flash}
+      - {provider: gemini, model: gemini-3.5-flash-lite}
+      # Gemma models are served free on the Gemini API with separate capacity from Flash.
+      - {provider: gemini, model: gemma-4-26b-a4b-it}
+      - {provider: gemini, model: gemma-4-31b-it}
+      - {provider: ollama, model: qwen2.5vl:3b}
+
+  # Stages not listed here use the text chain.
+  stages:
+    shot-image-qa: vision
+    combined-video-judge: vision

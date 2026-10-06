@@ -36,7 +36,7 @@ def _requested_count(topic: str, noun: str) -> int | None:
 
 
 def _narration_words(text: str) -> list[str]:
-    return re.findall(r"\w+", text.casefold())
+    return text.casefold().split()
 
 
 def _count_targets(topic: str, duration: str, story: str = "") -> tuple[int, int, int | None, int | None, str]:

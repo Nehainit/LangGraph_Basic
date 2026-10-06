@@ -3,6 +3,10 @@ import json
 from video_automation.agents import director_agent
 
 
+def test_hindi_narration_words_are_counted_by_spoken_words():
+    assert len(director_agent._narration_words("राजा रानी के पास गया")) == 5
+
+
 BIBLE = {
     "theme": "homecoming",
     "characters": [

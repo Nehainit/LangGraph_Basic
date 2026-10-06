@@ -1,10 +1,14 @@
 import json
+import os
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from video_automation.agents import story_agent
 from video_automation.agents import story_review_agent
+from video_automation import prompts
 
 
 USER_INPUT = "Create a 30-second story where Raja and Chuha share a mango. Include a golden bell. No violence."
@@ -240,6 +244,30 @@ def test_user_input_validation_and_structured_request():
     assert json.loads(json.dumps(result, ensure_ascii=False)) == result
 
 
+def test_hindi_romanized_roles_are_explained_to_story_and_reviewer():
+    expected = story_result()
+    expected["parsed_requirements"]["language"] = "Hindi"
+    model = FakeModel([SAFE, expected, {"approved": True, "issues": []}])
+    with patch.object(story_agent, "load_model", return_value=model), patch.object(story_review_agent, "load_model", return_value=model):
+        story_agent.create_story({"topic": "Raja aur cuha", "language": "Hindi"})
+
+    assert "Raja means king" in prompt_text(model.prompts[1])
+    assert "cuha means mouse" in prompt_text(model.prompts[1])
+    assert "Raja means king" in prompt_text(model.prompts[2])
+    assert "Chuha means mouse" in prompt_text(model.prompts[2])
+
+
+def test_explicit_language_is_kept_when_story_model_misparses_it():
+    expected = story_result()
+    expected["parsed_requirements"]["language"] = "English"
+    model = FakeModel([SAFE, expected, {"approved": True, "issues": []}])
+    with patch.object(story_agent, "load_model", return_value=model), patch.object(story_review_agent, "load_model", return_value=model):
+        result = story_agent.create_story({"topic": "Raja aur cuha", "language": "Hindi"})
+
+    assert result["parsed_requirements"]["language"] == "Hindi"
+    assert '"language": "Hindi"' in prompt_text(model.prompts[2])
+
+
 def test_unsafe_input_is_blocked_before_story_generation():
     model = FakeModel([{
         "safe": False,
@@ -275,6 +303,22 @@ def test_safety_accepts_semantically_safe_json_variants():
     model = FakeModel([{"safe": "true", "categories": ["family", "adventure"], "reason": "No prohibited content detected."}])
     with patch.object(story_agent, "load_model", return_value=model):
         assert story_agent._check_input_safety({"topic": "A friendly picnic story"})
+
+
+@pytest.mark.skipif(os.getenv("RUN_OLLAMA_INTEGRATION") != "1", reason="requires local Ollama")
+def test_ollama_safety_accepts_benign_cinematic_prompt(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+    monkeypatch.setenv("SAFETY_MODEL", "qwen2.5:3b-instruct")
+
+    evaluation = story_agent._check_input_safety({
+        "topic": (
+            "Raja and rani in forest get lost and seraching for food and some forest fairies help "
+            "them to get some food and fdrinking water but rani faintas after dringkin water and "
+            "raja as if looks at screen and camera zoom in raja has expression of suprise"
+        )
+    })
+
+    assert evaluation["purpose"] == "review_user_input_safety"
 
 
 def test_unsafe_generated_story_is_rejected_and_regenerated():
@@ -313,7 +357,7 @@ def test_human_revision_and_existing_graph_handoff():
     with patch.object(story_agent, "load_model", return_value=model), patch.object(story_review_agent, "load_model", return_value=model):
         result = graph.invoke(state, config)
         assert result["story_outline"] == initial["story"]
-        assert result["parsed_requirements"] == initial["parsed_requirements"]
+        assert result["parsed_requirements"] == {**initial["parsed_requirements"], "language": "English"}
         assert result["story_beats"] == initial["story"]["structure"]
         assert isinstance(result["__interrupt__"][0].value["story"], str)
         result = graph.invoke(Command(resume={"action": "regenerate", "note": "Make the ending surprising."}), config)
@@ -391,3 +435,10 @@ if __name__ == "__main__":
     test_human_revision_and_existing_graph_handoff()
     test_story_review_agent_accepts_requirements_and_story_directly()
     test_saved_requirements_are_reused_without_extracting_again()
+
+
+def test_hindi_species_words_are_explained_when_english_is_selected():
+    guidance = prompts._hindi_term_guidance("sher and cuha", "English")
+
+    assert "sher means lion" in guidance and "cuha means mouse" in guidance
+    assert prompts._hindi_term_guidance("Morning in Paris", "English") == ""

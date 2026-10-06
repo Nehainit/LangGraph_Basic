@@ -10,6 +10,7 @@ from video_automation.models import invoke_with_evaluation, load_model
 from video_automation.prompts import (
     NARRATION_REVIEW_SYSTEM_PROMPT,
     NARRATION_SYSTEM_PROMPT,
+    PIPELINE_CONFIG,
     SCENE_FAITHFULNESS_REVIEW_SYSTEM_PROMPT,
     SCENE_PLANNING_CONFIG,
     SCENE_PLANNING_SYSTEM_PROMPT,
@@ -221,6 +222,12 @@ def _review_narration_traceability(model, story: dict, segments: list[dict], eva
     return issues
 
 
+def _is_hindi_text(text: str) -> bool:
+    devanagari = sum("\u0900" <= char <= "\u097f" for char in text)
+    latin = sum("a" <= char.casefold() <= "z" for char in text)
+    return devanagari > 0 and devanagari >= latin
+
+
 def create_narration_script(state: AgentState) -> dict:
     requirements = state.get("parsed_requirements") or {}
     story = state.get("story_outline") or {
@@ -228,8 +235,14 @@ def create_narration_script(state: AgentState) -> dict:
         "structure": state.get("story_beats", []),
     }
     seconds = requirements.get("duration_seconds") or _duration_seconds(state["duration"])
-    language = requirements.get("language") or state["language"]
+    language = state.get("language") or requirements.get("language") or "English"
+    hindi = str(language).strip().casefold() in {"hindi", "hi"}
     minimum, maximum = max(8, round(seconds * 1.2)), max(8, round(seconds * 1.7))
+    target_words = int(state.get("narration_target_words") or 0)
+    length_instruction = (
+        f"Use at most {target_words} words total across all segments; measured TTS timing requires this shorter limit."
+        if target_words else f"Suggested narration length: {minimum}-{maximum} words; TTS will determine exact timing."
+    )
     feedback = state.get("narration_feedback", "") or " ".join(
         str(item.get("note", "")) for item in state.get("director_feedback", [])
     )
@@ -244,8 +257,9 @@ def create_narration_script(state: AgentState) -> dict:
 When needs_story_revision is true, return an empty narration_segments list and a specific revision_reason.
 Otherwise return exactly one narration segment per approved story beat, in the same order.
 Target duration: approximately {seconds} seconds.
-Suggested narration length: {minimum}-{maximum} words; TTS will determine exact timing.
+{length_instruction}
 Language: {language}
+{"Write every narration segment in Hindi in Devanagari script. Translate English story beats into Hindi; keep their meaning and event order." if hindi else "Write every narration segment in the requested language."}
 Approved story: {json.dumps(story, ensure_ascii=False)}
 Fixed user requirements: {json.dumps(requirements, ensure_ascii=False)}
 Revision requirement: {feedback or 'none'}"""
@@ -309,6 +323,8 @@ Revision requirement: {feedback or 'none'}"""
                 if not isinstance(text, str) or not text.strip():
                     raise RuntimeError("Every narration segment needs spoken text.")
                 text = text.strip()
+                if hindi and not _is_hindi_text(text):
+                    raise RuntimeError("Narration must be Hindi in Devanagari script in every segment.")
                 texts.append(text)
                 normalized.append({
                     "segment_id": f"segment-{index:03}",
@@ -318,8 +334,14 @@ Revision requirement: {feedback or 'none'}"""
             segments = normalized
             narration = " ".join(texts)
             words = len(_narration_words(narration))
-            best = (narration, segments, round(words / 1.5, 1))
-            issues = _review_narration_traceability(model, story, segments, evaluations)
+            if not target_words or best is None or words < len(_narration_words(best[0])):
+                best = (narration, segments, round(words / 1.5, 1))
+            if target_words and words > target_words:
+                raise RuntimeError(f"Narration has {words} words; use at most {target_words} words to fit measured speech timing.")
+            issues = (
+                _review_narration_traceability(model, story, segments, evaluations)
+                if PIPELINE_CONFIG["planning"]["narration_semantic_review"] else []
+            )
             if issues:
                 raise RuntimeError("; ".join(issues))
             result = {
@@ -332,7 +354,7 @@ Revision requirement: {feedback or 'none'}"""
                 "director_feedback": [],
                 "llm_evaluations": evaluations,
             }
-            if not minimum <= words <= maximum:
+            if not target_words and not minimum <= words <= maximum:
                 result["warnings"] = [
                     *state.get("warnings", []),
                     f"Narration estimate is outside {minimum}-{maximum} words; TTS timing will decide whether regeneration is needed.",
@@ -358,7 +380,7 @@ Revision requirement: {feedback or 'none'}"""
         str(beat.get("description", "")).strip()
         for beat in story.get("structure", [])
     ]
-    if fallback_texts and all(fallback_texts):
+    if fallback_texts and all(fallback_texts) and (not hindi or all(_is_hindi_text(text) for text in fallback_texts)):
         segments = [
             {"segment_id": f"segment-{index:03}", "parent_beat_ids": [beat["beat_id"]], "text": text}
             for index, (beat, text) in enumerate(zip(story["structure"], fallback_texts), start=1)
@@ -593,6 +615,18 @@ def _validate_scene_plan(data: object, state: AgentState) -> tuple[list[dict], l
     return normalized, analysis
 
 
+def _visible_action_pacing(state: AgentState) -> list[dict]:
+    target = float(PIPELINE_CONFIG["shot_grammar"]["target_shot_seconds"])
+    return [
+        {
+            "segment_id": timing["segment_id"],
+            "suggested_visible_actions": max(1, round((float(timing["end_seconds"]) - float(timing["start_seconds"])) / target)),
+        }
+        for timing in state.get("narration_segment_timings", [])
+        if isinstance(timing, dict) and timing.get("segment_id")
+    ]
+
+
 def plan_scenes(state: AgentState) -> dict:
     config = SCENE_PLANNING_CONFIG
     if not config["enabled"]:
@@ -602,6 +636,7 @@ def plan_scenes(state: AgentState) -> dict:
         "approved_story_beats": (state.get("story_outline") or {}).get("structure", state.get("story_beats", [])),
         "narration_segments": state.get("narration_segments", []),
         "narration_timing": state.get("narration_segment_timings", []),
+        "visible_action_pacing": _visible_action_pacing(state),
         "audio_duration_seconds": state.get("actual_narration_seconds"),
         "approved_characters": context["characters"],
         "visual_style": context["visual_style"],
@@ -869,10 +904,70 @@ def _validate_visual_plan(data: object, state: AgentState) -> list[dict]:
     return normalized
 
 
+# Distinct views of one approved action, used when a scene needs more shots than it has actions.
+COVERAGE_VIEWS = (
+    ("{action}", "{focus} within its surroundings"),
+    ("Faces and reactions as {focus}", "the characters' emotional reaction"),
+    ("The key gesture or object as {focus}", "the most important gesture or object in this moment"),
+)
+
+
+def _derived_visual_plan(state: AgentState) -> dict:
+    """Build visual beats from approved scene actions, without a model call.
+
+    Scenes are paced at about one beat per target_shot_seconds by adding reaction and detail
+    views of the same approved action, so no new story content is invented.
+    """
+    target = float(PIPELINE_CONFIG["shot_grammar"]["target_shot_seconds"])
+    groups = []
+    for scene in state.get("scenes") or []:
+        actions = [str(action).strip() for action in scene.get("visible_actions") or [] if str(action).strip()]
+        if not actions:
+            raise RuntimeError(f'{scene["scene_id"]} has no visible actions to derive visual beats from.')
+        seconds = float(scene.get("end_sec", 0)) - float(scene.get("start_sec", 0))
+        moments = min(len(actions) * len(COVERAGE_VIEWS), max(len(actions), round(seconds / target)))
+        views = [moments // len(actions) + (1 if index < moments % len(actions) else 0) for index in range(len(actions))]
+        moments_text = []
+        for action, count in zip(actions, views):
+            focus = action.rstrip(".")
+            moments_text.extend(
+                (template.format(action=action, focus=focus), focus_template.format(focus=focus))
+                for template, focus_template in COVERAGE_VIEWS[:count]
+            )
+        goal = str(scene.get("scene_goal") or "").strip()
+        groups.append({"visual_beats": [
+            {
+                "visual_action": action,
+                "visual_focus": focus,
+                "emotional_intent": str(scene.get("emotion") or "").strip(),
+                "continuity_in": f"Continues from: {moments_text[index - 1][0]}" if index else f"Scene opens toward: {goal}",
+                "continuity_out": (
+                    f"Leads into: {moments_text[index + 1][0]}" if index + 1 < len(moments_text) else f"Scene resolves: {goal}"
+                ),
+                "story_purpose": str(scene.get("story_purpose") or goal).strip(),
+            }
+            for index, (action, focus) in enumerate(moments_text)
+        ]})
+    return _complete_visual_plan({"needs_revision": False, "revision_reason": None, "scenes": groups}, state)
+
+
 def create_visual_beats(state: AgentState) -> dict:
     config = VISUAL_PLANNING_CONFIG
     if not config["enabled"]:
         raise RuntimeError("Visual planning is disabled in config/visual_planning.yml.")
+    if PIPELINE_CONFIG["planning"]["visual_beats_mode"] == "derive_from_scenes" and not state.get("visual_plan_feedback"):
+        try:
+            beats = _validate_visual_plan(_derived_visual_plan(state), state)
+            return {
+                "visual_beats": beats,
+                "visual_plan_needs_revision": False,
+                "visual_plan_revision_reason": None,
+                "visual_plan_issues": [],
+                "visual_plan_feedback": "",
+                "count_adjustment": f"Derived {len(beats)} visual beats from {len(state['scenes'])} approved scenes.",
+            }
+        except (RuntimeError, KeyError) as exc:
+            logger.warning("Derived visual beats failed validation; asking the visual planner: %s", exc)
     inputs = {
         "narration_segments": state.get("narration_segments", []),
         "narration_timing": state.get("narration_segment_timings", []),
@@ -1104,6 +1199,11 @@ def _validate_shot_plan(data: object, state: AgentState) -> list[dict]:
             raise RuntimeError(f"Shot introduced a character outside the approved cast: {exc.args[0]}") from exc
         if raw_characters != characters:
             raise RuntimeError("Shot characters_present must use exact approved character IDs, not display names.")
+        # A character named in the visible action is drawn by the image model, so it needs its reference sheet.
+        depicted = " ".join(str(shot.get(key, "")) for key in ("visual_action", "visual_focus", "composition"))
+        for alias, character_id in cast.items():
+            if character_id not in characters and re.search(rf"\b{re.escape(alias)}\b", depicted, re.IGNORECASE):
+                characters.append(character_id)
         if not set(characters) <= scene_characters:
             raise RuntimeError("Shot includes a character outside its approved scene.")
         for key in (
@@ -1148,7 +1248,63 @@ def _validate_shot_plan(data: object, state: AgentState) -> list[dict]:
         expected = float(scene["end_sec"]) - float(scene["start_sec"])
         if abs(durations.get(scene_id, 0.0) - expected) > tolerance:
             raise RuntimeError(f"Shots for {scene_id} do not preserve its narration timing.")
-    return normalized
+    return _apply_shot_grammar(normalized, beat_by_id)
+
+
+# Example values from the shot planner prompt; small models sometimes copy them verbatim.
+SHOT_PLACEHOLDERS = {
+    key: value for key, value in re.findall(
+        r'"(\w+)": "([^"]+)"', SHOT_PLANNING_SYSTEM_PROMPT.split("Successful shape:", 1)[-1].split("}]", 1)[0]
+    )
+    if key not in {"framing", "camera_angle", "primary_subject"}
+}
+# Approved visual-beat fields that can stand in for a copied placeholder.
+BEAT_FALLBACKS = {
+    "visual_action": "visual_action", "visual_focus": "visual_focus", "emotion": "emotional_intent",
+    "continuity_in": "continuity_in", "continuity_out": "continuity_out", "shot_purpose": "story_purpose",
+}
+
+
+def _next_framing(framing: str) -> str:
+    key = framing.casefold()
+    if "close" in key:
+        return "wide"
+    return "medium" if "wide" in key else "close_up"
+
+
+def _apply_shot_grammar(shots: list[dict], beat_by_id: dict[str, dict]) -> list[dict]:
+    """Enforce shot variety; repairs what code can repair and rejects only genuine repeats."""
+    grammar = PIPELINE_CONFIG["shot_grammar"]
+
+    def action_key(text: str) -> str:
+        return " ".join(re.findall(r"\w+", text.casefold()))
+
+    result, seen = [], {}
+    for shot in shots:
+        shot = dict(shot)
+        beat = beat_by_id.get(shot["visual_beat_ids"][0], {}) if shot.get("visual_beat_ids") else {}
+        for key, placeholder in SHOT_PLACEHOLDERS.items():
+            if str(shot.get(key, "")).strip() == placeholder:
+                fallback = str(beat.get(BEAT_FALLBACKS.get(key, ""), "")).strip()
+                if not fallback:
+                    raise RuntimeError(f"{shot['shot_id']} copied the example {key}; describe this shot's own {key}.")
+                shot[key] = fallback
+        if grammar["reject_duplicate_actions"] and action_key(shot["visual_action"]) in seen:
+            if not beat.get("visual_action") or action_key(beat["visual_action"]) in seen:
+                raise RuntimeError(
+                    f"{shot['shot_id']} repeats the visual action of {seen[action_key(shot['visual_action'])]}; "
+                    "give every shot a distinct moment."
+                )
+            # The approved beat already names a distinct moment, so use it instead of the repeat.
+            shot["visual_action"], shot["visual_focus"] = beat["visual_action"], beat.get("visual_focus") or beat["visual_action"]
+        seen[action_key(shot["visual_action"])] = shot["shot_id"]
+        previous = result[-1] if result else None
+        if grammar["vary_repeated_framing"] and previous and previous["scene_id"] == shot["scene_id"] and (
+            (previous["framing"], previous["camera_angle"]) == (shot["framing"], shot["camera_angle"])
+        ):
+            shot["framing"] = _next_framing(previous["framing"])
+        result.append(shot)
+    return result
 
 
 def _shot_storyboard(shots: list[dict], state: AgentState) -> list[dict]:
@@ -1266,6 +1422,14 @@ def plan_shots(state: AgentState) -> dict:
 
 
 def critique_shots(state: AgentState) -> dict:
+    if not PIPELINE_CONFIG["planning"]["director_critic"]:
+        # Shot grammar and cast checks already run in _validate_shot_plan; this critic is advisory only.
+        return {
+            "director_plan": state["director_plan"],
+            "storyboard": state["storyboard"],
+            "director_approved": True,
+            "critic_issues": [],
+        }
     prompt = f"""
 You are the Director/Critic Agent. Return JSON only: {{"approved":true,"issues":[]}}.
 Check story, narration, visual-beat traceability, exact cast, location, still-image clarity, static framing,

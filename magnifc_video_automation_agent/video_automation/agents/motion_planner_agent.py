@@ -1,5 +1,6 @@
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from video_automation.models import invoke_with_evaluation, load_model
@@ -48,6 +49,28 @@ def _validate_motion_plan(value: object, shot_id: str, duration: float) -> dict:
     }
 
 
+def _plan_shot_motion(job: tuple) -> tuple[dict | None, list[dict], str]:
+    _, shot_id, duration, payload = job
+    model = load_model("motion-planner")
+    evaluations, error = [], ""
+    for _ in range(int(MOTION_PLANNING_CONFIG["max_retries"]) + 1):
+        response, evaluation = invoke_with_evaluation(
+            model,
+            [
+                {"role": "system", "content": MOTION_PLANNING_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps({**payload, "retry_feedback": error or payload["retry_feedback"]}, ensure_ascii=False)},
+            ],
+            agent_name="motion-planner",
+            purpose="plan_shot_motion",
+        )
+        evaluations.append(evaluation)
+        try:
+            return _validate_motion_plan(_parse_json(response.content), shot_id, duration), evaluations, ""
+        except (RuntimeError, ValueError, TypeError) as exc:
+            error = str(exc)
+    return None, evaluations, error
+
+
 def create_motion_plans(state: AgentState) -> dict:
     if not MOTION_PLANNING_CONFIG["enabled"]:
         raise RuntimeError("Motion Planner is disabled in config/motion_planning.yml.")
@@ -73,14 +96,14 @@ def create_motion_plans(state: AgentState) -> dict:
         item.get("segment_id"): item for item in state.get("narration_segment_timings", []) if isinstance(item, dict)
     }
     evaluations = list(state.get("llm_evaluations", []))
-    model = None
-    plans = []
+    slots: list[dict | None] = []
     revision_reasons = []
+    jobs = []
 
     for index, (shot, request, image_file, image_qa) in enumerate(zip(shots, requests, images, qa_results)):
         shot_id = shot["shot_id"]
         if shot_id not in targets and shot_id in existing:
-            plans.append(existing[shot_id])
+            slots.append(existing[shot_id])
             continue
         if not image_qa.get("approved") or not image_qa.get("animation_ready") or not image_file or not Path(image_file).is_file():
             revision_reasons.append(f"{shot_id}: approved animation-ready image is required.")
@@ -99,31 +122,24 @@ def create_motion_plans(state: AgentState) -> dict:
             "image_qa_result": image_qa,
             "retry_feedback": feedback_by_id.get(shot_id, ""),
         }
-        error = ""
-        model = model or load_model("motion-planner")
-        for _ in range(int(MOTION_PLANNING_CONFIG["max_retries"]) + 1):
-            response, evaluation = invoke_with_evaluation(
-                model,
-                [
-                    {"role": "system", "content": MOTION_PLANNING_SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps({**payload, "retry_feedback": error}, ensure_ascii=False)},
-                ],
-                agent_name="motion-planner",
-                purpose="plan_shot_motion",
-            )
-            evaluation["call_number"] = len(evaluations) + 1
-            evaluations.append(evaluation)
-            try:
-                plan = _validate_motion_plan(_parse_json(response.content), shot_id, duration)
-                if plan["needs_revision"]:
-                    revision_reasons.append(f"{shot_id}: {plan['revision_reason']}")
-                else:
-                    plans.append(plan)
-                break
-            except (RuntimeError, ValueError, TypeError) as exc:
-                error = str(exc)
-        else:
-            raise RuntimeError(error or f"Motion Planner failed for {shot_id}.")
+        jobs.append((len(slots), shot_id, duration, payload))
+        slots.append(None)
+
+    if jobs:
+        # Shots are planned independently, so their model calls run concurrently.
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 4), thread_name_prefix="motion-plan") as pool:
+            outcomes = list(pool.map(_plan_shot_motion, jobs))
+        for (slot, shot_id, _, _), (plan, shot_evaluations, error) in zip(jobs, outcomes):
+            for evaluation in shot_evaluations:
+                evaluation["call_number"] = len(evaluations) + 1
+                evaluations.append(evaluation)
+            if plan is None:
+                raise RuntimeError(error or f"Motion Planner failed for {shot_id}.")
+            if plan["needs_revision"]:
+                revision_reasons.append(f"{shot_id}: {plan['revision_reason']}")
+            else:
+                slots[slot] = plan
+    plans = [plan for plan in slots if plan is not None]
 
     return {
         "motion_plans": plans,

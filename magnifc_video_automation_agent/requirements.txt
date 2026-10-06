@@ -1,11 +1,14 @@
+fal-client
 fastapi
 google-genai
 huggingface-hub
+langchain-core
 langchain-ollama
 langgraph
 langgraph-checkpoint-sqlite
 minio
 pillow
+pydantic
 python-dotenv
 PyYAML
 uvicorn

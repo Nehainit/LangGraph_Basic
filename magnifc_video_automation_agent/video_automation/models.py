@@ -3,11 +3,14 @@ import json
 import math
 import mimetypes
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+
+import yaml
 
 try:
     from dotenv import load_dotenv
@@ -17,6 +20,11 @@ except ModuleNotFoundError:
 
 load_dotenv()
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+with (Path(__file__).resolve().parents[1] / "config" / "models.yml").open(encoding="utf-8") as routing_file:
+    ROUTING_CONFIG = yaml.safe_load(routing_file)["routing"]
+_cooldown_until: dict[tuple[str, str], float] = {}
+_cooldown_lock = threading.Lock()
 
 AGENT_MODEL_ENV = {
     "orchestrator": "ORCHESTRATOR_MODEL",
@@ -52,6 +60,8 @@ def model_name_for(agent_name: str) -> str:
     env_name = AGENT_MODEL_ENV.get(agent_name)
     configured = os.getenv(env_name) if env_name else None
     provider = _provider()
+    if provider == "auto":
+        return _chain(agent_name)[0]["model"]
     if provider == "ollama":
         if agent_name == "shot-image-qa":
             return configured or os.getenv("OLLAMA_QA_MODEL", "qwen2.5vl:3b")
@@ -70,6 +80,19 @@ def model_name_for(agent_name: str) -> str:
 
 def validate_model_configuration(agent_name: str) -> str:
     provider = _provider()
+    if provider == "auto":
+        unavailable = []
+        for entry in _chain(agent_name):
+            if not _has_credentials(entry["provider"]):
+                unavailable.append(f"{entry['provider']}: no API key")
+                continue
+            if entry["provider"] != "ollama":
+                return entry["model"]
+            try:
+                return _validate_ollama_model(entry["model"])
+            except RuntimeError as exc:
+                unavailable.append(str(exc))
+        raise RuntimeError(f"No model is available for {agent_name}: " + "; ".join(unavailable))
     if agent_name == "shot-image-qa" and provider != "ollama" and not (
         os.getenv("SHOT_IMAGE_QA_MODEL") or os.getenv("QA_MODEL")
     ):
@@ -77,6 +100,10 @@ def validate_model_configuration(agent_name: str) -> str:
     model = model_name_for(agent_name)
     if provider != "ollama":
         return model
+    return _validate_ollama_model(model)
+
+
+def _validate_ollama_model(model: str) -> str:
     base_url = (os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
     if "://" not in base_url:
         base_url = f"http://{base_url}"
@@ -184,6 +211,9 @@ class GeminiChat:
                     parts.append(str(item))
         else:
             parts.append(str(prompt))
+        if system and self.model.startswith("gemma"):
+            # Gemma on the Gemini API does not accept a separate system instruction.
+            parts, system = [*system, *parts], []
         response = self.client.models.generate_content(
             model=self.model,
             contents=parts,
@@ -199,6 +229,55 @@ class GeminiChat:
             usage_metadata={
                 "input_tokens": int(getattr(usage, "prompt_token_count", 0) or 0),
                 "output_tokens": int(getattr(usage, "candidates_token_count", 0) or 0),
+            } if usage else None,
+        )
+
+
+class OpenAIChat:
+    """OpenAI Chat Completions adapter; accepts text, role messages, or text-and-image content parts."""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("Set OPENAI_API_KEY to use OpenAI models.")
+
+    def invoke(self, prompt):
+        if isinstance(prompt, list) and prompt and all(isinstance(item, dict) and "type" in item for item in prompt):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list) and all(isinstance(item, dict) for item in prompt):
+            messages = prompt
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
+        # GPT-5 models reject temperature and max_tokens; output length is capped with max_completion_tokens.
+        payload = json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "max_completion_tokens": int(os.getenv("OPENAI_MAX_COMPLETION_TOKENS", "4096")),
+            "reasoning_effort": os.getenv("OPENAI_REASONING_EFFORT", "low"),
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_request_timeout_seconds()) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 429 and "insufficient_quota" in detail:
+                raise RuntimeError("OpenAI credit is used up (HTTP 429 insufficient_quota). Add credit or rely on free models.") from exc
+            raise RuntimeError(f"OpenAI request failed: HTTP {exc.code} {detail}") from exc
+        usage = data.get("usage") or {}
+        return SimpleNamespace(
+            content=data["choices"][0]["message"]["content"],
+            usage_metadata={
+                "input_tokens": int(usage.get("prompt_tokens", 0)),
+                "output_tokens": int(usage.get("completion_tokens", 0)),
+                "total_tokens": int(usage.get("total_tokens", 0)),
             } if usage else None,
         )
 
@@ -260,13 +339,118 @@ class GroqChat:
             } if usage else None,
         )
 
+def _chain(agent_name: str) -> list[dict]:
+    chains = ROUTING_CONFIG["chains"]
+    return chains[ROUTING_CONFIG.get("stages", {}).get(agent_name, "text")]
+
+
+def _has_credentials(provider: str) -> bool:
+    if provider == "groq":
+        return bool(os.getenv("GROQ_API_KEY") or os.getenv("Groq_api_key") or os.getenv("groq_api_key"))
+    if provider in {"gemini", "google"}:
+        return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    if provider == "huggingface":
+        return bool(os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"))
+    if provider == "openai":
+        return bool(os.getenv("OPENAI_API_KEY"))
+    return provider == "ollama"
+
+
+def _client(provider: str, model: str, agent_name: str):
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=model,
+            temperature=0 if agent_name == "safety" else 0.3,
+            format="json",
+            num_ctx=int(os.getenv("OLLAMA_CONTEXT_TOKENS", "8192")),
+            num_predict=int(os.getenv("OLLAMA_MAX_OUTPUT_TOKENS", "2048")),
+            keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "10m"),
+            client_kwargs={"timeout": _request_timeout_seconds()},
+        )
+    if provider in {"gemini", "google"}:
+        return GeminiChat(model)
+    if provider == "groq":
+        return GroqChat(model)
+    if provider == "huggingface":
+        return HuggingFaceChat(model)
+    if provider == "openai":
+        return OpenAIChat(model)
+    raise RuntimeError(f"Unknown model provider in config/models.yml: {provider!r}.")
+
+
+def _is_capacity_error(error: Exception) -> bool:
+    text = str(error).casefold()
+    return any(marker in text for marker in (
+        "429", "503", "rate limit", "rate_limit", "resource_exhausted", "unavailable", "overloaded", "high demand",
+    ))
+
+
+class FallbackChat:
+    """Try each model in the stage's chain until one answers (MODEL_PROVIDER=auto)."""
+
+    def __init__(self, agent_name: str, chain: list[dict]):
+        self.agent_name = agent_name
+        self.chain = chain
+        self.format = None
+        self._clients: dict[tuple[str, str], object] = {}
+        self._served = threading.local()
+
+    @property
+    def model(self) -> str:
+        return getattr(self._served, "name", self.chain[0]["model"])
+
+    def invoke(self, prompt):
+        failures = []
+        for entry in self.chain:
+            key = (entry["provider"], entry["model"])
+            label = f"{entry['provider']}:{entry['model']}"
+            if not _has_credentials(entry["provider"]):
+                continue
+            if _cooldown_until.get(key, 0) > time.monotonic():
+                failures.append(f"{label} cooling down after a rate limit")
+                continue
+            try:
+                client = self._clients.get(key) or self._clients.setdefault(key, _client(*key, self.agent_name))
+                if entry["provider"] == "ollama":
+                    client.format = self.format or "json"
+                    response = client.invoke(_ollama_prompt(prompt))
+                else:
+                    response = client.invoke(prompt)
+            except Exception as exc:
+                if _is_capacity_error(exc):
+                    with _cooldown_lock:
+                        _cooldown_until[key] = time.monotonic() + float(ROUTING_CONFIG.get("cooldown_seconds", 60))
+                failures.append(f"{label} failed: {str(exc)[:200]}")
+                continue
+            self._served.name = label
+            return response
+        raise RuntimeError(f"Every model for {self.agent_name} failed: " + " | ".join(failures or ["no provider has credentials"]))
+
+
+def _ollama_prompt(prompt):
+    """Convert provider-neutral image content parts to the LangChain Ollama message shape."""
+    if isinstance(prompt, list) and prompt and all(isinstance(item, dict) and "type" in item for item in prompt):
+        from langchain_core.messages import HumanMessage
+
+        return [HumanMessage(content=[
+            {**item, "image_url": item["image_url"]["url"]}
+            if item.get("type") == "image_url" and isinstance(item.get("image_url"), dict) else item
+            for item in prompt
+        ])]
+    return prompt
+
+
 def load_model(agent_name: str):
+    if _provider() == "auto":
+        return FallbackChat(agent_name, _chain(agent_name))
     if _provider() == "ollama":
         from langchain_ollama import ChatOllama
 
         return ChatOllama(
             model=model_name_for(agent_name),
-            temperature=0.3,
+            temperature=0 if agent_name == "safety" else 0.3,
             format="json",
             num_ctx=int(os.getenv("OLLAMA_CONTEXT_TOKENS", "8192")),
             num_predict=int(os.getenv("OLLAMA_MAX_OUTPUT_TOKENS", "2048")),
@@ -320,6 +504,14 @@ def _evaluation(response, prompt, agent_name: str, purpose: str, model: str, *, 
     input_tokens, output_tokens, source = _token_usage(response, prompt)
     input_rate = _price("LLM_INPUT_USD_PER_1M_TOKENS")
     output_rate = _price("LLM_OUTPUT_USD_PER_1M_TOKENS")
+    routed = next((
+        entry for chain in ROUTING_CONFIG["chains"].values() for entry in chain
+        if f"{entry['provider']}:{entry['model']}" == model
+    ), None)
+    if routed:
+        # Routed models carry their own price; free tiers have none and cost $0.
+        input_rate = float(routed.get("usd_per_1m_input", 0))
+        output_rate = float(routed.get("usd_per_1m_output", 0))
     cost = None if input_rate is None or output_rate is None else round(
         (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000, 10
     )
@@ -346,14 +538,14 @@ def _evaluation(response, prompt, agent_name: str, purpose: str, model: str, *, 
     return result
 
 
-def invoke_with_images(agent_name: str, prompt: str, image_files: list[str]):
+def invoke_with_images(agent_name: str, prompt: str, image_files: list[str], model=None):
     images = []
     for file_path in image_files:
         mime_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
         encoded = base64.b64encode(Path(file_path).read_bytes()).decode("ascii")
         images.append(f"data:{mime_type};base64,{encoded}")
 
-    model = load_model(agent_name)
+    model = model or load_model(agent_name)
     if _provider() == "ollama":
         from langchain_core.messages import HumanMessage
 
@@ -369,8 +561,9 @@ def invoke_with_images(agent_name: str, prompt: str, image_files: list[str]):
 
 def invoke_with_images_and_evaluation(agent_name: str, prompt: str, image_files: list[str], *, purpose: str):
     started = time.monotonic()
-    response = invoke_with_images(agent_name, prompt, image_files)
+    model = load_model(agent_name)
+    response = invoke_with_images(agent_name, prompt, image_files, model)
     return response, _evaluation(
-        response, prompt, agent_name, purpose, model_name_for(agent_name),
+        response, prompt, agent_name, purpose, getattr(model, "model", model_name_for(agent_name)),
         elapsed_seconds=time.monotonic() - started,
     )

@@ -213,3 +213,26 @@ if __name__ == "__main__":
         test_dissolve_keeps_requested_runtime(Path(tmp))
     test_motion_filter()
     test_requires_assets()
+
+
+def test_music_and_ambience_duck_under_narration(tmp_path):
+    narration, music, ambience, mixed = (tmp_path / name for name in ("narr.mp3", "music.mp3", "amb.mp3", "mix.mp3"))
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=f=440:d=1.5:sample_rate=44100", "-af", "apad=whole_dur=4", str(narration)])
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=f=3000:d=4.5:sample_rate=48000", str(music)])
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anoisesrc=d=1:c=pink:a=0.3", str(ambience)])
+    state = {
+        "narration_file": str(narration), "music_file": str(music),
+        "ambience_tracks": [{"file": str(ambience), "start_seconds": 0.0, "duration_seconds": 3.5}],
+    }
+
+    _run_ffmpeg(editor_agent._audio_mix_command(state, [], 4.0, mixed))
+
+    def music_level(start, end):
+        report = subprocess.run(
+            ["ffmpeg", "-i", str(mixed), "-af", f"atrim={start}:{end},bandpass=f=3000:w=200,volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True,
+        ).stderr
+        return float(report.split("mean_volume: ")[1].split(" dB")[0])
+
+    assert abs(float(output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(mixed)])) - 4.0) < 0.1
+    assert music_level(2.6, 3.2) - music_level(0.6, 1.2) > 6

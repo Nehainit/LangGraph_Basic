@@ -9,7 +9,9 @@ from langgraph.graph import END, START, StateGraph
 from video_automation.agents.combined_video_judge import combined_video_judge
 from video_automation.agents.editor_agent import edit_video
 from video_automation.agents.edit_timeline_agent import plan_edit_timeline
-from video_automation.agents.image_agent import build_image_prompts, create_reference_package, create_visual_storyboard
+from video_automation.agents.image_agent import (
+    build_image_prompts, create_reference_package, create_visual_storyboard, prefetch_character_sheets,
+)
 from video_automation.agents.motion_planner_agent import create_motion_plans
 from video_automation.agents.narration_agent import create_narration
 from video_automation.agents.preproduction_agents import create_narration_script, create_visual_beats, critique_shots, plan_scenes, plan_shots
@@ -18,6 +20,7 @@ from video_automation.agents.rough_video_compiler import compile_rough_video
 from video_automation.schema import AgentState
 from video_automation.agents.shot_image_qa_agent import review_shot_images
 from video_automation.agents.shot_video_generation_agent import create_shot_videos
+from video_automation.agents.sound_bed_agent import create_sound_bed, prefetch_sound_bed
 from video_automation.agents.story_agent import create_story_node
 from video_automation.agents.story_hitl_agent import review_scene_plan, review_shot_plan, review_story, review_visual_plan, review_visual_storyboard
 from video_automation.agents.subtitle_agent import create_subtitles
@@ -89,6 +92,7 @@ def build_story_graph(
     sound_plan_creator: Callable[[AgentState], dict] | None = None,  # retained for caller compatibility; stage removed
     subtitle_creator: Callable[[AgentState], dict] = create_subtitles,
     editor: Callable[[AgentState], dict] = edit_video,
+    sound_bed_creator: Callable[[AgentState], dict] | None = None,
     checkpointer=None,
 ):
     def route_story(state: AgentState) -> str:
@@ -138,6 +142,10 @@ def build_story_graph(
             return "create_storyboard"
         return "review_visual_storyboard"
 
+    def route_storyboard(state: AgentState) -> str:
+        # A shot with no image because the budget ran out cannot become a video; stop before more spending.
+        return END if state.get("budget_exhausted") else "review_shot_images"
+
     def route_shot_image_qa(state: AgentState) -> str:
         if (
             state.get("shot_image_qa_retry_shots")
@@ -169,6 +177,23 @@ def build_story_graph(
 
     def route_motion(state: AgentState) -> str:
         return "review_shot_plan" if state.get("motion_plan_needs_revision") else "create_scene_videos"
+
+    if reference_creator is create_reference_package:
+        script_creator = narration_script_creator
+
+        def narration_script_creator(state: AgentState) -> dict:
+            # The story is approved here, so character sheets render while narration and planning run.
+            prefetch_character_sheets(state)
+            return script_creator(state)
+
+    if sound_bed_creator is None and editor is edit_video:
+        sound_bed_creator = create_sound_bed
+        video_creator = scene_video_creator
+
+        def scene_video_creator(state: AgentState) -> dict:
+            # Shots are approved here; ambience and music render while the provider generates video.
+            prefetch_sound_bed(state)
+            return video_creator(state)
 
     graph = StateGraph(AgentState)
     graph.add_node("create_story", _logged_step("create_story", story_creator))
@@ -203,7 +228,7 @@ def build_story_graph(
     graph.add_conditional_edges("review_visual_plan", route_visual_plan_review)
     graph.add_conditional_edges("plan_shots", route_shot_plan)
     graph.add_conditional_edges("review_shot_plan", route_shot_plan_review)
-    graph.add_edge("create_storyboard", "review_shot_images")
+    graph.add_conditional_edges("create_storyboard", route_storyboard)
     graph.add_conditional_edges("review_shot_images", route_shot_image_qa)
     graph.add_conditional_edges("review_visual_storyboard", route_visual)
     graph.add_conditional_edges("plan_motion", route_motion)
@@ -222,6 +247,11 @@ def build_story_graph(
         graph.add_conditional_edges("combined_video_judge", route_combined_video_judge)
     else:
         graph.add_edge("create_scene_videos", "create_subtitles")
-    graph.add_edge("create_subtitles", "edit_video")
+    if sound_bed_creator:
+        graph.add_node("create_sound_bed", _logged_step("create_sound_bed", sound_bed_creator))
+        graph.add_edge("create_subtitles", "create_sound_bed")
+        graph.add_edge("create_sound_bed", "edit_video")
+    else:
+        graph.add_edge("create_subtitles", "edit_video")
     graph.add_edge("edit_video", END)
     return graph.compile(checkpointer=checkpointer or InMemorySaver())

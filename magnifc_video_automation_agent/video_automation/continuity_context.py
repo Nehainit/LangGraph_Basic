@@ -1,5 +1,7 @@
 from typing import Any
 
+DEFAULT_VISUAL_STYLE = "cinematic storybook illustration"
+
 
 def character_definitions(state: dict[str, Any]) -> list[dict[str, str]]:
     """Return deterministic character IDs from approved user requirements."""
@@ -51,7 +53,8 @@ def location_definitions(state: dict[str, Any]) -> list[dict[str, str]]:
 def continuity_context(state: dict[str, Any]) -> dict[str, Any]:
     requirements = state.get("parsed_requirements") or {}
     return {
-        "visual_style": requirements.get("visual_style") or state.get("visual_style"),
+        # Resolved once here so character sheets, mood board, shots, and QA all use the same style.
+        "visual_style": str(requirements.get("visual_style") or state.get("visual_style") or DEFAULT_VISUAL_STYLE).strip(),
         "characters": character_definitions(state),
         "locations": location_definitions(state),
     }

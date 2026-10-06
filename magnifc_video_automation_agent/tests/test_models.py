@@ -151,6 +151,13 @@ def test_ollama_client_has_request_timeout(monkeypatch):
     assert model.keep_alive == "15m"
 
 
+def test_ollama_safety_model_is_deterministic(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
+
+    assert models.load_model("safety").temperature == 0
+    assert models.load_model("story").temperature == 0.3
+
+
 def test_llm_evaluation_includes_ollama_timings():
     response = SimpleNamespace(
         content='{"ok": true}',
@@ -227,3 +234,122 @@ if __name__ == "__main__":
     test_storyboard_model_override()
     test_default_model()
     test_ollama_default_model()
+
+
+def _routing(monkeypatch, responses):
+    """Route through fake clients; responses maps provider to a reply or an exception."""
+    calls = []
+
+    class FakeClient:
+        def __init__(self, provider):
+            self.provider = provider
+
+        def invoke(self, _prompt):
+            calls.append(self.provider)
+            outcome = responses[self.provider]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return SimpleNamespace(content=outcome, usage_metadata=None)
+
+    monkeypatch.setenv("MODEL_PROVIDER", "auto")
+    monkeypatch.setattr(models, "_client", lambda provider, _model, _agent: FakeClient(provider))
+    monkeypatch.setattr(models, "_cooldown_until", {})
+    monkeypatch.setitem(models.ROUTING_CONFIG, "chains", {"text": [
+        {"provider": "groq", "model": "big"}, {"provider": "gemini", "model": "flash"},
+    ]})
+    monkeypatch.setenv("GROQ_API_KEY", "key")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    return calls
+
+
+def test_auto_routing_falls_back_on_rate_limit_and_cools_the_provider_down(monkeypatch):
+    calls = _routing(monkeypatch, {"groq": RuntimeError("Groq request failed: HTTP 429 rate limit"), "gemini": '{"ok": 1}'})
+    model = models.load_model("story")
+
+    response, evaluation = models.invoke_with_evaluation(model, "prompt", agent_name="story", purpose="test")
+    models.load_model("scene").invoke("prompt")
+
+    assert response.content == '{"ok": 1}' and evaluation["model"] == "gemini:flash"
+    assert calls == ["groq", "gemini", "gemini"]  # the rate-limited provider is skipped while cooling down
+
+
+def test_auto_routing_skips_providers_without_keys_and_reports_every_failure(monkeypatch):
+    calls = _routing(monkeypatch, {"groq": '{"ok": 1}', "gemini": RuntimeError("HTTP 400 bad request")})
+    for name in ("GROQ_API_KEY", "Groq_api_key", "groq_api_key"):
+        monkeypatch.delenv(name, raising=False)
+
+    try:
+        models.load_model("story").invoke("prompt")
+    except RuntimeError as exc:
+        assert "gemini:flash failed: HTTP 400 bad request" in str(exc)
+    else:
+        raise AssertionError("expected every model to fail")
+    assert calls == ["gemini"]
+
+
+def test_openai_adapter_sends_gpt5_parameters_and_image_parts(monkeypatch):
+    sent = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"content": '{"approved": true}'}}],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 8, "total_tokens": 128},
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        sent.update(json.loads(request.data), url=request.full_url, auth=request.headers["Authorization"])
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(models.urllib.request, "urlopen", fake_urlopen)
+    parts = [{"type": "text", "text": "Review as JSON."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]
+
+    response = models.OpenAIChat("gpt-5-mini").invoke(parts)
+
+    assert response.content == '{"approved": true}' and response.usage_metadata["input_tokens"] == 120
+    assert sent["url"] == "https://api.openai.com/v1/chat/completions" and sent["auth"] == "Bearer sk-test"
+    assert sent["messages"] == [{"role": "user", "content": parts}]
+    assert "temperature" not in sent and "max_tokens" not in sent and sent["max_completion_tokens"] == 4096
+
+
+def test_openai_adapter_explains_exhausted_credit(monkeypatch):
+    import io
+    import urllib.error
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b'{"error": {"code": "insufficient_quota"}}'),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(models.urllib.request, "urlopen", fake_urlopen)
+    try:
+        models.OpenAIChat("gpt-5-mini").invoke("Return JSON.")
+    except RuntimeError as exc:
+        assert "credit is used up" in str(exc)
+    else:
+        raise AssertionError("expected an exhausted-credit error")
+
+
+def test_routed_model_cost_uses_its_configured_price(monkeypatch):
+    calls = _routing(monkeypatch, {"groq": '{"ok": 1}', "gemini": '{"ok": 1}'})
+    monkeypatch.setitem(models.ROUTING_CONFIG, "chains", {"text": [
+        {"provider": "groq", "model": "big", "usd_per_1m_input": 0.05, "usd_per_1m_output": 0.40},
+    ]})
+
+    class Priced:
+        model = "groq:big"
+
+        def invoke(self, _prompt):
+            return SimpleNamespace(content="{}", usage_metadata={"input_tokens": 1_000_000, "output_tokens": 500_000})
+
+    _, evaluation = models.invoke_with_evaluation(Priced(), "prompt", agent_name="story", purpose="test")
+
+    assert evaluation["cost_usd"] == 0.25 and calls == []

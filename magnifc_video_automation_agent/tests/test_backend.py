@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from video_automation import backend
 import pytest
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +65,7 @@ def test_web_request_auto_advances_review_checkpoints(monkeypatch):
         assert fake_graph.initial_state["quality_mode"] == "standard"
         assert fake_graph.initial_state["aspect_ratio"] == "9:16"
         assert fake_graph.initial_state["video_quality"] == "standard"
+        assert fake_graph.initial_state["image_provider"] == "magnific"
         assert response["warnings"] == ["local fallback"]
         assert response["video_url"] == "/output/outputs/test.mp4"
         assert [command.resume for command in fake_graph.commands] == [{"action": "approve", "note": ""}] * 2
@@ -193,6 +195,88 @@ def test_aspect_ratio_and_output_quality_are_accepted():
     request = backend.VideoRequest(topic="A story", aspect_ratio="16:9", video_quality="high")
     assert request.aspect_ratio == "16:9"
     assert request.video_quality == "high"
+
+
+def test_image_provider_defaults_to_magnific_and_rejects_unknown_values():
+    assert backend.VideoRequest(topic="A story").image_provider == "magnific"
+    with pytest.raises(ValueError):
+        backend.VideoRequest(topic="A story", image_provider="other")
+
+
+def test_selected_image_provider_is_passed_to_graph():
+    original_graph = backend.graph
+    fake_graph = FakeGraph()
+    backend.graph = fake_graph
+    try:
+        backend.create_video(backend.VideoRequest(topic="A story", image_provider="fal"))
+    finally:
+        backend.graph = original_graph
+
+    assert fake_graph.initial_state["image_provider"] == "fal"
+
+
+def test_selected_visual_style_is_passed_to_graph_as_explicit_style():
+    with pytest.raises(ValueError):
+        backend.VideoRequest(topic="A story", visual_style="watercolor")
+    original_graph = backend.graph
+    fake_graph = FakeGraph()
+    backend.graph = fake_graph
+    try:
+        backend.create_video(backend.VideoRequest(topic="A story"))
+        assert "visual_style" not in fake_graph.initial_state
+        backend.create_video(backend.VideoRequest(topic="A story", visual_style="anime"))
+    finally:
+        backend.graph = original_graph
+
+    assert "anime" in fake_graph.initial_state["visual_style"].lower()
+
+
+def test_model_catalog_and_independent_selection():
+    catalog = backend.model_catalog()["models"]
+    assert {item["stage"] for item in catalog} == {"narration", "image", "video"}
+    assert len(catalog) == 6
+    assert all({"provider", "id", "display_name", "cost"} <= item.keys() for item in catalog)
+    assert next(item for item in catalog if item["id"] == "nano-banana-pro-flash")["cost"]["quality_rates"] == {"standard": 0.095, "high": 0.143}
+
+    original_graph = backend.graph
+    fake_graph = FakeGraph()
+    backend.graph = fake_graph
+    try:
+        backend.create_video(backend.VideoRequest(
+            topic="A story", narration_model="eleven_multilingual_v2",
+            image_model="fal-ai/nano-banana-pro", video_model="kling-v2-6-pro",
+        ))
+    finally:
+        backend.graph = original_graph
+    assert fake_graph.initial_state["narration_model"] == "eleven_multilingual_v2"
+    assert fake_graph.initial_state["image_model"] == "fal-ai/nano-banana-pro"
+    assert fake_graph.initial_state["video_model"] == "kling-v2-6-pro"
+
+
+def test_model_defaults_legacy_mapping_and_invalid_ids():
+    assert backend.VideoRequest(topic="A story").image_model is None
+    assert backend.resolve_request_models(backend.VideoRequest(topic="A story")) == {
+        "narration_model": "eleven_flash_v2_5",
+        "image_model": "nano-banana-pro-flash",
+        "video_model": "kling-v2-6-pro",
+    }
+    assert backend.resolve_request_models(backend.VideoRequest(topic="A story", image_provider="fal"))["video_model"] == "fal-ai/kling-video/v2.6/pro/image-to-video"
+    assert backend.resolve_request_models(backend.VideoRequest(topic="A story", image_provider="fal", image_model="fal-ai/nano-banana-pro"))["video_model"] == "kling-v2-6-pro"
+    from video_automation.model_catalog import selected_model
+    assert selected_model({"image_provider": "fal", "image_model": "fal-ai/nano-banana-pro"}, "video")["id"] == "kling-v2-6-pro"
+    with pytest.raises(ValueError, match="Unknown image model"):
+        backend.VideoRequest(topic="A story", image_model="https://untrusted.example/model")
+
+
+def test_catalog_http_and_unknown_model_request_validation():
+    client = TestClient(backend.app)
+    catalog = client.get("/api/model-catalog")
+    assert catalog.status_code == 200
+    assert len(catalog.json()["models"]) == 6
+    assert "api-key" not in catalog.text.lower()
+    response = client.post("/api/create-video", json={"topic": "A story", "video_model": "unknown"})
+    assert response.status_code == 422
+    assert "Unknown video model" in response.text
 
 
 def test_unsafe_request_returns_bad_request(monkeypatch):

@@ -4,6 +4,8 @@ import os
 import threading
 from pathlib import Path
 
+import pytest
+
 from video_automation.agents import image_agent
 from PIL import Image
 
@@ -166,6 +168,8 @@ def test_visual_storyboard_uses_built_image_prompt(tmp_path):
         assert result["generated_images"][0]["resolution"] == "2K"
         assert result["generated_images"][0]["generation_attempt"] == 1
         assert result["generated_images"][0]["image_path"] == result["image_files"][0]
+        assert result["generated_images"][0]["provider"] == "magnific"
+        assert result["generated_images"][0]["model_used"] == "nano-banana-pro-flash"
 
     with_fake_images(run)
 
@@ -191,6 +195,300 @@ def _shot_image_state(tmp_path, previous_ids):
         "thread_id": "thread", "topic": "Parallel images", "output_dir": str(tmp_path),
         "shot_plan": shots, "image_prompt_requests": requests,
     }
+
+
+class FalStub:
+    """Fake of fal's queue API: submit, status, and result."""
+
+    class Completed:
+        pass
+
+    def __init__(self, result, pending_polls=0):
+        self.outcome = result
+        self.pending_polls = pending_polls
+        self.uploads = []
+        self.calls = []
+        self.status_checks = []
+
+    def upload_file(self, path):
+        self.uploads.append(path)
+        return f"https://fal.example/{Path(path).name}"
+
+    def submit(self, model, *, arguments):
+        self.calls.append((model, arguments))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return type("Handle", (), {"request_id": f"request-{len(self.calls)}"})()
+
+    def status(self, model, request_id):
+        self.status_checks.append(request_id)
+        if self.pending_polls:
+            self.pending_polls -= 1
+            return object()
+        return self.Completed()
+
+    def result(self, model, request_id):
+        return self.outcome
+
+
+def _fal_image_result(url="https://fal.example/generated.png"):
+    return {
+        "images": [{
+            "url": url,
+            "content_type": "image/png",
+            "file_name": "generated.png",
+            "file_size": 5,
+            "width": 1024,
+            "height": 1024,
+        }],
+        "description": "Generated still image.",
+    }
+
+
+def test_fal_reference_free_image_uses_text_endpoint_without_image_urls(monkeypatch, tmp_path):
+    stub = FalStub(_fal_image_result())
+    image_file = tmp_path / "shot.png"
+    monkeypatch.setattr(image_agent, "fal_client", stub, raising=False)
+    monkeypatch.setattr(image_agent, "_get_bytes", lambda url: b"image" if url.endswith("generated.png") else b"")
+
+    model = image_agent._generate_fal_reference_image("A still", "16:9", image_file, [], "2K")
+
+    assert model == "fal-ai/nano-banana-pro"
+    assert stub.uploads == []
+    assert stub.calls == [("fal-ai/nano-banana-pro", {
+        "prompt": "A still", "aspect_ratio": "16:9", "resolution": "2K", "output_format": "png",
+    })]
+    assert image_file.read_bytes() == b"image"
+    assert not image_file.with_suffix(".job.json").exists()
+
+
+def test_fal_referenced_image_uploads_files_and_uses_edit_endpoint(monkeypatch, tmp_path):
+    references = [tmp_path / "character.png", tmp_path / "previous.png"]
+    for reference in references:
+        reference.write_bytes(b"reference")
+    stub = FalStub(_fal_image_result())
+    image_file = tmp_path / "shot.png"
+    monkeypatch.setattr(image_agent, "fal_client", stub, raising=False)
+    monkeypatch.setattr(image_agent, "_get_bytes", lambda _url: b"image")
+
+    model = image_agent._generate_fal_reference_image(
+        "Preserve identity", "9:16", image_file, [str(path) for path in references], "1K"
+    )
+
+    assert model == "fal-ai/nano-banana-pro/edit"
+    assert stub.uploads == [str(path) for path in references]
+    assert stub.calls[0] == ("fal-ai/nano-banana-pro/edit", {
+        "prompt": "Preserve identity",
+        "aspect_ratio": "9:16",
+        "resolution": "1K",
+        "output_format": "png",
+        "image_urls": ["https://fal.example/character.png", "https://fal.example/previous.png"],
+    })
+    assert image_file.read_bytes() == b"image"
+
+
+def test_fal_image_without_output_url_fails_cleanly(monkeypatch, tmp_path):
+    monkeypatch.setattr(image_agent, "fal_client", FalStub({"images": []}), raising=False)
+
+    with pytest.raises(RuntimeError, match="image URL"):
+        image_agent._generate_fal_reference_image("A still", "1:1", tmp_path / "shot.png", [], "1K")
+
+
+@pytest.mark.parametrize("key", [None, "   "])
+def test_fal_key_is_validated_before_worker_pool(monkeypatch, tmp_path, key):
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    if key is None:
+        monkeypatch.delenv("FAL_KEY", raising=False)
+    else:
+        monkeypatch.setenv("FAL_KEY", key)
+    monkeypatch.setattr(
+        image_agent,
+        "ThreadPoolExecutor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker pool must not start")),
+    )
+
+    with pytest.raises(RuntimeError, match="FAL_KEY"):
+        image_agent.create_visual_storyboard(state)
+
+
+def test_fal_timeout_is_retried_and_recorded(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    stub = FalStub(TimeoutError("fal request timed out"))
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.setattr(image_agent, "fal_client", stub, raising=False)
+
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert item["generation_status"] == "failed"
+    assert item["generation_attempt"] == 3
+    assert item["error"] == "fal request timed out"
+    assert len(stub.calls) == 3
+
+
+def test_fal_failure_does_not_fall_back_to_magnific_and_records_metadata(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.setattr(
+        image_agent,
+        "_generate_fal_reference_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fal unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        image_agent,
+        "_generate_reference_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Magnific fallback is forbidden")),
+    )
+
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert item["generation_status"] == "failed"
+    assert item["error"] == "fal unavailable"
+    assert item["generation_attempt"] == 3
+    assert item["provider"] == "fal"
+    assert item["model_used"] == "fal-ai/nano-banana-pro"
+
+
+def test_fal_success_records_reference_appropriate_model(monkeypatch, tmp_path):
+    reference = tmp_path / "character.png"
+    reference.write_bytes(b"reference")
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    state["shot_plan"][0]["characters_present"] = ["raja_001"]
+    state["image_prompt_requests"][0].update({
+        "character_reference_ids": ["raja_001"],
+        "character_reference_files": [str(reference)],
+    })
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    def generate(_prompt, _size, image_file, _references, _resolution):
+        image_file.write_bytes(b"image")
+        return "fal-ai/nano-banana-pro/edit"
+
+    monkeypatch.setattr(image_agent, "_generate_fal_reference_image", generate, raising=False)
+
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert item["generation_status"] == "success"
+    assert item["provider"] == "fal"
+    assert item["model_used"] == "fal-ai/nano-banana-pro/edit"
+
+
+def test_explicit_image_model_dispatches_independently_and_replaces_other_model_cache(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "magnific", "image_model": "fal-ai/nano-banana-pro", "video_model": "kling-v2-6-pro"}
+    cached = tmp_path / "old.png"
+    cached.write_bytes(b"old")
+    state["image_files"] = [str(cached)]
+    state["generated_images"] = [{"shot_id": "shot-001", "generation_status": "success", "provider": "magnific", "model_used": "nano-banana-pro-flash", "image_path": str(cached)}]
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    calls = []
+
+    def generate(_prompt, _size, image_file, _references, _resolution):
+        calls.append(image_file)
+        image_file.write_bytes(b"new")
+        return "fal-ai/nano-banana-pro"
+
+    monkeypatch.setattr(image_agent, "_generate_fal_reference_image", generate)
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert len(calls) == 1
+    assert item["image_path"] != str(cached)
+    assert item["provider"] == "fal"
+    assert item["selected_model_id"] == "fal-ai/nano-banana-pro"
+
+
+def test_cached_images_get_or_preserve_provider_metadata(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None, None]), "image_provider": "fal"}
+    cached_files = [tmp_path / "cached-1.png", tmp_path / "cached-2.png"]
+    for cached in cached_files:
+        cached.write_bytes(b"image")
+    state["image_files"] = [str(path) for path in cached_files]
+    state["generated_images"] = [{
+        "shot_id": "shot-002", "scene_id": "scene-001", "image_path": str(cached_files[1]),
+        "image_url": None, "character_reference_ids": [], "location_id": "location-001",
+        "generation_status": "success", "provider": "magnific", "model_used": "legacy-model",
+        "generation_attempt": 1, "error": None,
+    }]
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    first, second = image_agent.create_visual_storyboard(state)["generated_images"]
+
+    assert (first["provider"], first["model_used"]) == ("fal", "fal-ai/nano-banana-pro")
+    assert (second["provider"], second["model_used"]) == ("magnific", "legacy-model")
+
+
+def test_cached_reference_model_survives_predecessor_regeneration(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None, "shot-001"]), "image_provider": "fal"}
+    cached_files = [tmp_path / "cached-1.png", tmp_path / "cached-2.png"]
+    for cached in cached_files:
+        cached.write_bytes(b"image")
+    state["image_files"] = [str(path) for path in cached_files]
+    state["shot_image_qa_retry_shots"] = ["shot-001"]
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    def generate(_prompt, _size, image_file, _references, _resolution):
+        image_file.write_bytes(b"new image")
+        return "fal-ai/nano-banana-pro"
+
+    monkeypatch.setattr(image_agent, "_generate_fal_reference_image", generate)
+
+    items = image_agent.create_visual_storyboard(state)["generated_images"]
+
+    assert items[1]["image_path"] == str(cached_files[1])
+    assert (items[1]["provider"], items[1]["model_used"]) == ("fal", "fal-ai/nano-banana-pro/edit")
+
+
+def test_cached_partial_provenance_keeps_provider_model_pair(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    cached = tmp_path / "cached.png"
+    cached.write_bytes(b"image")
+    state["image_files"] = [str(cached)]
+    state["generated_images"] = [{
+        "shot_id": "shot-001", "scene_id": "scene-001", "image_path": str(cached),
+        "generation_status": "success", "model_used": "nano-banana-pro-flash",
+    }]
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert (item["provider"], item["model_used"]) == ("magnific", "nano-banana-pro-flash")
+
+
+def test_magnific_reference_generation_keeps_post_request_delay(monkeypatch, tmp_path):
+    delays = []
+    monkeypatch.setattr(image_agent, "_json_request", lambda *_args, **_kwargs: {"data": [{"base64": PNG_1X1}]})
+    monkeypatch.setattr(image_agent, "_magnific_headers", lambda: {})
+    monkeypatch.setattr(image_agent.time, "sleep", delays.append)
+
+    image_agent._generate_reference_image("A still", "1:1", tmp_path / "shot.png", [], improve_prompt=False)
+
+    assert delays == [1]
+
+
+def test_fal_dependency_cycle_records_provider_and_model(monkeypatch, tmp_path):
+    state = {**_shot_image_state(tmp_path, ["shot-002", "shot-001"]), "image_provider": "fal"}
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    items = image_agent.create_visual_storyboard(state)["generated_images"]
+
+    assert all(item["provider"] == "fal" for item in items)
+    assert all(item["model_used"] == "fal-ai/nano-banana-pro" for item in items)
+
+
+def test_fal_validation_failure_records_edit_model(monkeypatch, tmp_path):
+    reference = tmp_path / "character.png"
+    reference.write_bytes(b"reference")
+    state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
+    state["image_prompt_requests"][0].update({
+        "character_reference_ids": ["unexpected-character"],
+        "character_reference_files": [str(reference)],
+    })
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    item = image_agent.create_visual_storyboard(state)["generated_images"][0]
+
+    assert item["generation_status"] == "failed"
+    assert item["provider"] == "fal"
+    assert item["model_used"] == "fal-ai/nano-banana-pro/edit"
 
 
 def test_independent_shot_images_generate_concurrently_in_order(monkeypatch, tmp_path):
@@ -325,10 +623,99 @@ def test_reference_package_is_versioned_and_regenerated_together(tmp_path):
         assert Path(second["mood_board_file"]).name == "mood_board_v002.png"
         assert all(Path(path).exists() for path in (first["character_board_file"], first["mood_board_file"], second["character_board_file"], second["mood_board_file"]))
         assert len(calls) == 4
-        assert "layout reference only" in calls[0][1]["reference_images"][0]["text"]
+        # The layout template is opt-in because image models copy the person in it.
+        assert "reference_images" not in calls[0][1]
+        assert "Layout: three full-body views" in calls[0][1]["prompt"]
         assert "use colder moonlight" in calls[-1][1]["prompt"]
 
     with_fake_images(run)
+
+
+def test_reference_package_model_change_regenerates_cached_boards(monkeypatch, tmp_path):
+    calls = []
+
+    def generate(state, _prompt, _size, path, _references, *_args, **_kwargs):
+        calls.append(state["image_model"])
+        path.write_bytes(base64.b64decode(PNG_1X1))
+
+    monkeypatch.setattr(image_agent, "_generate_provider_image", generate)
+    state = {
+        "topic": "Raja", "tone": "cinematic", "characters": ["Raja"],
+        "story": "Raja returns.", "output_dir": str(tmp_path),
+        "image_model": "nano-banana-pro-flash",
+    }
+    first = image_agent.create_reference_package(state)
+    second = image_agent.create_reference_package({**state, **first, "image_model": "fal-ai/nano-banana-pro"})
+
+    assert calls == ["nano-banana-pro-flash"] * 2 + ["fal-ai/nano-banana-pro"] * 2
+    assert first["reference_model_id"] == "nano-banana-pro-flash"
+    assert second["reference_model_id"] == "fal-ai/nano-banana-pro"
+    assert second["character_board_file"] != first["character_board_file"]
+
+
+def test_fal_reference_package_never_calls_magnific(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    def fal_image(prompt, size, path, references, resolution):
+        calls.append((prompt, list(references)))
+        path.write_bytes(base64.b64decode(PNG_1X1))
+        return image_agent._fal_image_model(references)
+
+    monkeypatch.setattr(image_agent, "_generate_fal_reference_image", fal_image)
+    monkeypatch.setattr(image_agent, "_generate_reference_image", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Magnific used")))
+    state = {
+        "topic": "Fal reference run", "tone": "cinematic", "characters": ["Raja"],
+        "story": "Raja returns home.", "output_dir": str(tmp_path), "image_provider": "fal",
+    }
+
+    result = image_agent.create_reference_package(state)
+
+    assert len(calls) == 2
+    assert Path(result["character_board_file"]).is_file()
+    assert Path(result["mood_board_file"]).is_file()
+
+
+def test_fal_video_uses_fal_image_upload_without_magnific(monkeypatch, tmp_path, capsys):
+    image = tmp_path / "shot.png"
+    image.write_bytes(base64.b64decode(PNG_1X1))
+    calls = []
+    monkeypatch.setenv("FAL_KEY", "test-key")
+
+    class FakeFal:
+        def upload_file(self, path):
+            calls.append(("upload", path))
+            return "https://fal.example/shot.png"
+
+        Completed = FalStub.Completed
+
+        def submit(self, model, arguments, **_kwargs):
+            calls.append((model, arguments))
+            return type("Handle", (), {"request_id": "video-request"})()
+
+        def status(self, _model, _request_id):
+            return self.Completed()
+
+        def result(self, _model, _request_id):
+            return {"video": {"url": "https://fal.example/shot.mp4"}}
+
+    monkeypatch.setattr(image_agent, "fal_client", FakeFal())
+    monkeypatch.setattr(image_agent, "_json_request", lambda *_args: (_ for _ in ()).throw(AssertionError("Magnific used")))
+    monkeypatch.setattr(image_agent, "_get_bytes", lambda _url: b"fake mp4")
+    monkeypatch.setattr(image_agent, "_video_is_usable", lambda _path: True)
+    monkeypatch.setattr(image_agent.time, "sleep", lambda _seconds: None)
+
+    output = image_agent._generate_scene_video_file(
+        {"image_provider": "magnific", "video_model": "fal-ai/kling-video/v2.6/pro/image-to-video"}, {"duration_seconds": 5}, str(image),
+        tmp_path / "shot.mp4", "Animate the shot", aspect_ratio="social_story_9_16",
+    )
+
+    assert Path(output).read_bytes() == b"fake mp4"
+    assert calls[0] == ("upload", str(image))
+    assert calls[1][0] == "fal-ai/kling-video/v2.6/pro/image-to-video"
+    assert calls[1][1]["start_image_url"] == "https://fal.example/shot.png"
+    log = capsys.readouterr().out
+    assert all(f"{phase} elapsed=" in log for phase in ("upload", "provider_wait", "download", "probe"))
 
 
 def test_regenerates_only_selected_shot(tmp_path):
@@ -564,3 +951,98 @@ if __name__ == "__main__":
     with TemporaryDirectory() as tmp:
         test_public_mode_uses_wan_27_image_url_and_director_duration(Path(tmp))
     test_improved_prompt_respects_both_magnific_limits()
+
+
+def test_character_specs_keep_story_description():
+    state = {"characters": [{"name": "Sher", "description": "A businessman in his late 30s."}]}
+
+    assert image_agent._character_specs(state) == ["Sher — A businessman in his late 30s."]
+
+
+def test_reference_legend_names_each_attached_image():
+    prompt = image_agent._with_reference_legend("Draw the shot.", 2, ["character sheet for Sher"])
+
+    assert prompt == (
+        "Attached reference images, in order. Image 1: character sheet for Sher. "
+        "Image 2: reference image.\nDraw the shot."
+    )
+    assert image_agent._with_reference_legend("Draw the shot.", 0, None) == "Draw the shot."
+
+
+def test_later_shots_reference_the_scene_anchor_so_they_render_in_parallel():
+    def planned(number, scene_id, framing):
+        return {
+            "shot_id": f"shot-{number:03}", "scene_id": scene_id, "visual_beat_ids": [f"vb-{number:03}"],
+            "source_segment_ids": [f"segment-{number:03}"], "characters_present": [], "primary_subject": "path",
+            "visual_action": f"The path at moment {number}.", "visual_focus": f"path moment {number}",
+            "framing": framing, "camera_angle": "eye_level", "composition": "The path recedes between trees.",
+            "emotion": "calm", "location_id": "location-001", "estimated_duration_seconds": 2.0,
+            "continuity_in": "", "continuity_out": "", "shot_purpose": "Set the place.",
+        }
+
+    result = image_agent.build_image_prompts({
+        "shot_plan": [
+            planned(1, "scene-001", "wide"), planned(2, "scene-001", "medium"),
+            planned(3, "scene-001", "close_up"), planned(4, "scene-002", "wide"),
+        ],
+        "production_bible": {"locations": [{"location_id": "location-001", "description": "forest path"}]},
+    })
+
+    assert [item["previous_shot_id"] for item in result["image_prompt_requests"]] == [
+        None, "shot-001", "shot-001", None,
+    ]
+
+
+def test_location_plate_is_attached_to_shots_in_that_location(tmp_path):
+    def run(calls):
+        plate = tmp_path / "location_plate.png"
+        plate.write_bytes(base64.b64decode(PNG_1X1))
+        state = {**_shot_image_state(tmp_path, [None]), "location_reference_files": {"location-001": str(plate)}}
+
+        result = image_agent.create_visual_storyboard(state)
+
+        assert result["generated_images"][0]["generation_status"] == "success"
+        references = calls[0][1]["reference_images"]
+        assert len(references) == 1 and "empty background plate" in references[0]["text"]
+
+    with_fake_images(run)
+
+
+def test_reference_package_renders_one_plate_per_location(tmp_path):
+    def run(calls):
+        result = image_agent.create_reference_package({
+            "topic": "Raja returns home", "tone": "warm", "characters": ["Raja"], "story": "Raja returns home.",
+            "output_dir": str(tmp_path), "visual_style": "storybook watercolor",
+            "scenes": [
+                {"scene_id": "scene-001", "location_id": "location-001", "location_description": "forest path"},
+                {"scene_id": "scene-002", "location_id": "location-001"},
+                {"scene_id": "scene-003", "location_id": "location-002", "location_description": "cottage door"},
+            ],
+        })
+
+        plates = result["location_reference_files"]
+        assert set(plates) == {"location-001", "location-002"} and all(Path(path).is_file() for path in plates.values())
+        plate_prompts = [payload["prompt"] for _, payload in calls if "background plate" in payload["prompt"]]
+        assert len(plate_prompts) == 2 and all("storybook watercolor" in prompt for prompt in plate_prompts)
+        assert len(calls) == 4  # one character sheet, two plates, one mood board
+
+    with_fake_images(run)
+
+
+def test_prefetched_character_sheets_are_reused_by_the_reference_package(tmp_path):
+    def run(calls):
+        state = {
+            "topic": "Prefetch run", "tone": "warm", "characters": ["Raja"], "story": "Raja returns home.",
+            "output_dir": str(tmp_path),
+        }
+        image_agent.prefetch_character_sheets(state)
+        image_agent.prefetch_character_sheets(state)  # a second start for the same story is ignored
+
+        result = image_agent.create_reference_package(state)
+
+        sheet_calls = [payload for _, payload in calls if "reference sheet" in payload["prompt"]]
+        assert len(sheet_calls) == 1
+        assert [Path(path).name for path in result["character_reference_files"]] == ["character_001_raja_v001.png"]
+        assert len(calls) == 2  # one prefetched sheet and the mood board
+
+    with_fake_images(run)

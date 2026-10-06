@@ -62,6 +62,13 @@ scene_planning:
 
     Do not invent exact timing outside the supplied narration timing.
 
+    Visible Action Pacing
+
+    visible_action_pacing gives a suggested number of visible actions for each narration segment.
+    Give each scene about that many distinct visible moments so every shot can hold the screen for about
+    5 seconds. Reach the number with different views of the approved events (an establishing view of the
+    place, the action itself, a reaction, an important detail), never by inventing new plot events.
+
     Scene Boundary Principle
 
     When force_one_segment_per_scene is true, map every scene to exactly one narration segment.
@@ -174,7 +181,8 @@ scene_planning:
     allow_new_relationships: false
     allow_new_conflicts: false
     allow_new_resolutions: false
-    semantic_review_enabled: true
+    # Advisory only (a rejected plan still continues); costs one model call per attempt.
+    semantic_review_enabled: false
 
   scene_boundaries:
     split_on_location_change: true

@@ -154,6 +154,8 @@ def create_story(user_input: str | dict) -> dict:
             if requirements is None:
                 validate_story_requirements(result["parsed_requirements"])
                 requirements = result["parsed_requirements"]
+                if user_request.get("language"):
+                    requirements["language"] = user_request["language"]
             result = {"story": _complete_story_outline(result["story"]), "parsed_requirements": requirements}
             previous_story = result["story"]
             validate_story_outline(previous_story)

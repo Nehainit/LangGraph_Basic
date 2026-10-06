@@ -11,6 +11,7 @@ try:
 except ModuleNotFoundError:
     load_dotenv = lambda *args, **kwargs: None
 
+from video_automation.cost_control import fingerprint, ledger_for, narration_price, paid_call
 from video_automation.schema import AgentState
 from video_automation.agents.story_agent import _duration_seconds
 
@@ -21,6 +22,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 DEFAULT_ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_flash_v2_5"
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+MAX_NARRATION_TIMING_ATTEMPTS = 3
 
 
 def _slug(text: str) -> str:
@@ -117,6 +119,8 @@ def _narration_result(
     allowed_seconds = _duration_seconds(state["duration"])
     result = {
         "narration_file": str(narration_file),
+        "narration_provider": "ElevenLabs",
+        "narration_model_used": state.get("narration_model") or state.get("elevenlabs_tts_model") or os.getenv("ELEVENLABS_TTS_MODEL", DEFAULT_ELEVENLABS_TTS_MODEL),
         "narration_alignment_file": str(alignment_file),
         "narration_alignment": alignment,
         "narration_segment_timings": scene_timings,
@@ -124,15 +128,33 @@ def _narration_result(
         "actual_narration_seconds": spoken_seconds,
     }
     if spoken_seconds > allowed_seconds:
+        attempts = int(state.get("narration_timing_attempts", 0)) + 1
+        if attempts >= MAX_NARRATION_TIMING_ATTEMPTS:
+            return {
+                **result,
+                "narration_feedback": "",
+                "narration_target_words": 0,
+                "narration_timing_attempts": attempts,
+                "warnings": [
+                    *state.get("warnings", []),
+                    f"Narration takes {spoken_seconds:.1f}s after {attempts} attempts; "
+                    f"requested video length was {allowed_seconds:g}s. The video will follow the complete audio.",
+                ],
+            }
+        items = _narration_items(state)
+        words = sum(len(line.split()) for _, line in items)
+        target_words = max(len(items), int(words * allowed_seconds / spoken_seconds * 0.85))
         note = (
-            f"Shorten this shot's narration while preserving its story meaning. "
-            f"The combined voice-over is {spoken_seconds:.1f}s but the movie is {allowed_seconds}s."
+            f"Shorten the narration to at most {target_words} words total while preserving the story beats. "
+            f"The voice-over is {spoken_seconds:.1f}s but the movie is {allowed_seconds:g}s."
         )
         return {
             **result,
             "narration_feedback": note,
+            "narration_target_words": target_words,
+            "narration_timing_attempts": attempts,
         }
-    return result
+    return {**result, "narration_feedback": "", "narration_target_words": 0, "narration_timing_attempts": 0}
 
 
 def create_narration(state: AgentState) -> dict[str, object]:
@@ -142,11 +164,13 @@ def create_narration(state: AgentState) -> dict[str, object]:
     meta_file = out / "narration.json"
     alignment_file = out / "narration_alignment.json"
 
-    voice_id = state.get("elevenlabs_voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
-    model_id = state.get("elevenlabs_tts_model") or os.getenv("ELEVENLABS_TTS_MODEL", DEFAULT_ELEVENLABS_TTS_MODEL)
+    voice_id = state.get("elevenlabs_voice_id") or os.getenv("ELEVENLABS_VOICE_ID") or DEFAULT_ELEVENLABS_VOICE_ID
+    model_id = state.get("narration_model") or state.get("elevenlabs_tts_model") or os.getenv("ELEVENLABS_TTS_MODEL", DEFAULT_ELEVENLABS_TTS_MODEL)
+    language = state.get("language") or (state.get("parsed_requirements") or {}).get("language") or ""
+    language_code = "hi" if str(language).strip().casefold() in {"hindi", "hi"} else None
     items = _narration_items(state)
     text = "\n".join(line for _, line in items)
-    meta = {"text": text, "voice_id": voice_id, "model_id": model_id, "timestamps": True}
+    meta = {"text": text, "provider": "ElevenLabs", "voice_id": voice_id, "model_id": model_id, "language_code": language_code, "timestamps": True}
 
     if narration_file.exists() and meta_file.exists() and alignment_file.exists():
         if json.loads(meta_file.read_text(encoding="utf-8")) == meta:
@@ -156,7 +180,12 @@ def create_narration(state: AgentState) -> dict[str, object]:
             return _narration_result(state, narration_file, alignment_file, alignment, scene_timings)
 
     url = f"{ELEVENLABS_TTS_URL}/{voice_id}/with-timestamps?{parse.urlencode({'output_format': 'mp3_44100_128'})}"
-    data = _json_request(url, {"text": text, "model_id": model_id}, _elevenlabs_headers())
+    payload = {"text": text, "model_id": model_id}
+    if language_code:
+        payload["language_code"] = language_code
+    ledger = ledger_for(state)
+    with paid_call(ledger, f"narration:{fingerprint(meta)}", "narration", "narration", narration_price(state, len(text))):
+        data = _json_request(url, payload, _elevenlabs_headers())
     alignment = data.get("alignment") or data.get("normalized_alignment")
     if not data.get("audio_base64") or not alignment:
         raise RuntimeError("Narration agent needs ElevenLabs audio and alignment data.")
@@ -168,4 +197,7 @@ def create_narration(state: AgentState) -> dict[str, object]:
         json.dumps({"text": text, "alignment": alignment, "narration_segment_timings": scene_timings}, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    return _narration_result(state, narration_file, alignment_file, alignment, scene_timings)
+    return {
+        **_narration_result(state, narration_file, alignment_file, alignment, scene_timings),
+        "cost_ledger": ledger.snapshot(),
+    }

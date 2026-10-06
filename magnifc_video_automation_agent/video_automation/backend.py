@@ -8,8 +8,9 @@ from typing import Literal
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 
 from video_automation.agent_graph import build_story_graph, persistent_checkpointer
 from video_automation.models import validate_model_configuration
+from video_automation.model_catalog import DEFAULT_MODELS, LEGACY_PROVIDER_MODELS, MODELS, model_entry
+from video_automation.prompts import PIPELINE_CONFIG
 from video_automation.agents.story_agent import UnsafeContentError
 from video_automation.agents.video_validator import validate_generated_videos
 from video_automation.artifact_store import archive_artifacts
@@ -30,6 +33,18 @@ class VideoRequest(BaseModel):
     quality_mode: Literal["standard", "refine"] = "standard"
     aspect_ratio: Literal["16:9", "9:16", "1:1"] = "9:16"
     video_quality: Literal["standard", "high"] = "standard"
+    image_provider: Literal["magnific", "fal"] = "magnific"
+    visual_style: Literal["cinematic", "illustrated", "3d_animation", "anime"] | None = None
+    narration_model: str | None = None
+    image_model: str | None = None
+    video_model: str | None = None
+
+    @field_validator("narration_model", "image_model", "video_model")
+    @classmethod
+    def supported_model(cls, value: str | None, info) -> str | None:
+        if value is not None:
+            model_entry(info.field_name.removesuffix("_model"), value)
+        return value
 
 
 class StoryReviewRequest(BaseModel):
@@ -79,6 +94,8 @@ class VisualStoryboardReviewRequest(DirectorReviewRequest):
 
 
 app = FastAPI()
+app.mount("/static", StaticFiles(directory=FRONTEND), name="frontend")
+app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
 logger = logging.getLogger(__name__)
 graph = build_story_graph(
     checkpointer=persistent_checkpointer(ROOT / ".langgraph-checkpoints.sqlite"),
@@ -217,6 +234,14 @@ def _artifacts(result: dict) -> dict:
         "judge_exhausted_shots": result.get("judge_exhausted_shots", []),
         "judge_decision": result.get("judge_decision"),
         "pipeline_status": result.get("pipeline_status"),
+        "cost_ledger": result.get("cost_ledger", []),
+        "spent_usd": round(
+            sum(float(entry["usd"]) for entry in result.get("cost_ledger", []))
+            + sum(float(item.get("cost_usd") or 0) for item in result.get("llm_evaluations", [])),
+            4,
+        ),
+        "budget_usd": PIPELINE_CONFIG["budget"]["max_usd_per_video"],
+        "budget_exhausted": result.get("budget_exhausted", False),
         "story_feedback_history": result.get("story_feedback_history", []),
         "reference_feedback_history": result.get("reference_feedback_history", []),
         "director_feedback_history": result.get("director_feedback_history", []),
@@ -395,6 +420,28 @@ def index() -> FileResponse:
     return FileResponse(FRONTEND / "index.html")
 
 
+VISUAL_STYLES = {
+    "cinematic": "Cinematic live-action look with natural light and a shallow depth of field",
+    "illustrated": "Hand-illustrated storybook look with soft painterly textures",
+    "3d_animation": "Polished 3D animated feature-film look",
+    "anime": "Japanese anime look with clean line art and vivid cel shading",
+}
+
+
+@app.get("/api/model-catalog")
+def model_catalog() -> dict:
+    return {"models": MODELS, "pricing_note": "Indicative public API rates; actual charges depend on provider billing."}
+
+
+def resolve_request_models(request: VideoRequest) -> dict[str, str]:
+    legacy = LEGACY_PROVIDER_MODELS[request.image_provider] if not (request.image_model or request.video_model) else {}
+    return {
+        "narration_model": request.narration_model or DEFAULT_MODELS["narration"],
+        "image_model": request.image_model or legacy.get("image") or DEFAULT_MODELS["image"],
+        "video_model": request.video_model or legacy.get("video") or DEFAULT_MODELS["video"],
+    }
+
+
 @app.post("/api/create-video")
 def create_video(request: VideoRequest) -> dict:
     if not request.topic.strip():
@@ -417,6 +464,9 @@ def create_video(request: VideoRequest) -> dict:
                 "quality_mode": request.quality_mode,
                 "aspect_ratio": request.aspect_ratio,
                 "video_quality": request.video_quality,
+                "image_provider": request.image_provider,
+                **resolve_request_models(request),
+                **({"visual_style": VISUAL_STYLES[request.visual_style]} if request.visual_style else {}),
                 "warnings": [],
             },
             {"configurable": {"thread_id": thread_id}},

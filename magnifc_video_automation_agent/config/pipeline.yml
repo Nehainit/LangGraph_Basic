@@ -1,0 +1,61 @@
+version: 1
+
+pipeline:
+  planning:
+    # These LLM reviewers re-check work that code already validates, and never block the run.
+    # Each one costs a full model call; turn them back on when a stronger model is configured.
+    narration_semantic_review: false
+    director_critic: false
+    # derive_from_scenes builds one visual beat per approved scene action in code.
+    # llm asks the visual planner model instead (one extra generate call plus its reviewer).
+    visual_beats_mode: derive_from_scenes
+
+  shot_grammar:
+    # A repeated action is replaced by its approved visual beat, and rejected only when that repeats too.
+    reject_duplicate_actions: true
+    # Consecutive shots in one scene with the same framing and angle get the next framing (wide/medium/close-up).
+    vary_repeated_framing: true
+    # Kling renders 5 or 10 second clips, so scenes are paced at about one visible moment per 5 seconds.
+    target_shot_seconds: 5
+
+  images:
+    workers: 4
+    # scene_anchor: every later shot in a scene uses the scene's first shot as its continuity reference,
+    # so a scene renders in two parallel waves. previous_shot: each shot waits for the one before it.
+    continuity_reference: scene_anchor
+    # One empty background plate per location, attached to every shot set there.
+    location_plates: true
+    # Five-view template image used for character sheets. Off by default because image models copy its person.
+    use_character_layout_template: false
+    max_reference_images:
+      magnific: 3
+      fal: 6
+
+  sound:
+    enabled: true
+    ambience: true
+    music: true
+    narration_volume: 1.0
+    ambience_volume: 0.35
+    music_volume: 0.22
+    duck_under_narration: true
+
+  finishing:
+    # Applied to the whole picture so every shot shares one grade. Empty string disables it.
+    color_grade: "eq=contrast=1.04:saturation=1.06,vignette=angle=PI/6"
+    fade_seconds: 0.5
+
+  budget:
+    # Paid calls stop once a video would cost more than this. Redos then keep the best result so far
+    # (or free FFmpeg camera motion for video); a first-time image that cannot be afforded stops the run.
+    max_usd_per_video: 5.0
+    # Automatic redos (image QA, video validation, timeline, final judge) allowed per shot.
+    # Your own regenerate requests are not limited, but still count toward the budget.
+    max_paid_redos_per_shot:
+      image: 1
+      video: 1
+    # Providers that bill in credits rather than USD. Set these to include those calls in the budget;
+    # null counts them as $0.
+    magnific_usd_per_credit: null
+    elevenlabs_sound_usd_per_call: null
+    elevenlabs_music_usd_per_minute: null

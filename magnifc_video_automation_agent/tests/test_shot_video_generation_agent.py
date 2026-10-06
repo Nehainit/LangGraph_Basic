@@ -24,6 +24,46 @@ def _state(tmp_path, count=3, quality_mode="standard"):
     }
 
 
+def test_fal_video_generation_does_not_require_minio(monkeypatch, tmp_path):
+    state = {**_state(tmp_path, count=1), "image_provider": "fal"}
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.delenv("MINIO_PUBLIC_ENDPOINT", raising=False)
+    seen = []
+
+    def generate(_state, _scene, _image_file, video_file, *_args):
+        seen.append(_state["image_provider"])
+        video_file.write_bytes(b"video")
+        return str(video_file)
+
+    monkeypatch.setattr(shot_video_generation_agent, "_generate_scene_video_file", generate)
+    monkeypatch.setattr(shot_video_generation_agent, "_clip", lambda *_args: (_ for _ in ()).throw(AssertionError("FFmpeg used")))
+    result = shot_video_generation_agent.create_shot_videos(state)
+
+    assert seen == ["fal"]
+    assert result["generated_videos"][0]["model_used"] == "fal-ai/kling-video/v2.6/pro/image-to-video"
+
+
+def test_explicit_video_model_ignores_image_provider_and_replaces_cached_video(monkeypatch, tmp_path):
+    state = {**_state(tmp_path, count=1, quality_mode="refine"), "image_provider": "magnific", "image_model": "nano-banana-pro-flash", "video_model": "fal-ai/kling-video/v2.6/pro/image-to-video"}
+    state["generated_videos"] = [{"shot_id": "shot-001", "video_file": "old.mp4", "provider": "magnific", "model_used": "kling-v2-6-pro"}]
+    state["video_retry_shots"] = ["shot-002"]
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.delenv("MINIO_PUBLIC_ENDPOINT", raising=False)
+    calls = []
+
+    def generate(_state, _scene, _image_file, video_file, *_args):
+        calls.append(_state["video_model"])
+        video_file.write_bytes(b"video")
+        return str(video_file)
+
+    monkeypatch.setattr(shot_video_generation_agent, "_generate_scene_video_file", generate)
+    result = shot_video_generation_agent.create_shot_videos(state)
+
+    assert calls == ["fal-ai/kling-video/v2.6/pro/image-to-video"]
+    assert result["generated_videos"][0]["provider"] == "fal"
+    assert result["generated_videos"][0]["selected_model_id"] == calls[0]
+
+
 def test_shots_generate_concurrently_and_keep_storyboard_order(monkeypatch, tmp_path):
     state = _state(tmp_path)
     active = 0
@@ -56,6 +96,37 @@ def test_shots_generate_concurrently_and_keep_storyboard_order(monkeypatch, tmp_
     assert peak == 2
     assert [item["shot_id"] for item in result["generated_videos"]] == ["shot-001", "shot-002", "shot-003"]
     assert "video_candidates" not in result
+
+
+def test_fal_starts_five_clips_together_by_default(monkeypatch, tmp_path):
+    state = {**_state(tmp_path, count=5), "video_model": "fal-ai/kling-video/v2.6/pro/image-to-video"}
+    started = threading.Barrier(5, timeout=2)
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_GENERATION_WORKERS", raising=False)
+    monkeypatch.delenv("MINIO_PUBLIC_ENDPOINT", raising=False)
+
+    def generate(_state, _scene, _image_file, video_file, *_args):
+        started.wait()
+        video_file.write_bytes(b"video")
+        return str(video_file)
+
+    monkeypatch.setattr(shot_video_generation_agent, "_generate_scene_video_file", generate)
+    monkeypatch.setattr(shot_video_generation_agent, "_clip", lambda *_args: (_ for _ in ()).throw(AssertionError("FFmpeg used")))
+
+    result = shot_video_generation_agent.create_shot_videos(state)
+
+    assert started.n_waiting == 0
+    assert all(item["provider"] == "fal" for item in result["generated_videos"])
+    assert all(item["generation_status"] == "success" for item in result["generated_videos"])
+
+
+def test_video_worker_limits_are_provider_specific(monkeypatch):
+    monkeypatch.delenv("VIDEO_GENERATION_WORKERS", raising=False)
+    assert shot_video_generation_agent._worker_count(5, "magnific") == 3
+    assert shot_video_generation_agent._worker_count(5, "fal") == 5
+
+    monkeypatch.setenv("VIDEO_GENERATION_WORKERS", "2")
+    assert shot_video_generation_agent._worker_count(5, "fal") == 2
 
 
 def test_refine_retry_generates_only_rejected_shot(monkeypatch, tmp_path):

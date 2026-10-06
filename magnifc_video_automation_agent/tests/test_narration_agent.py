@@ -71,6 +71,25 @@ def test_create_narration(tmp_path):
     assert round(result["scene_timings"][1]["start_seconds"], 1) == 2.4
 
 
+def test_narration_model_selection_invalidates_cached_audio(monkeypatch, tmp_path):
+    calls = []
+
+    def generate(_url, payload, _headers):
+        calls.append(payload["model_id"])
+        return {"audio_base64": base64.b64encode(b"audio").decode(), "alignment": alignment_for(payload["text"])}
+
+    monkeypatch.setattr(narration_agent, "_json_request", generate)
+    monkeypatch.setattr(narration_agent, "_elevenlabs_headers", lambda: {})
+    state = {"topic": "A story", "duration": "30 seconds", "output_dir": str(tmp_path), "story": "Hello."}
+    first = narration_agent.create_narration({**state, "narration_model": "eleven_flash_v2_5"})
+    second = narration_agent.create_narration({**state, "narration_model": "eleven_multilingual_v2"})
+
+    assert calls == ["eleven_flash_v2_5", "eleven_multilingual_v2"]
+    assert first["narration_model_used"] == "eleven_flash_v2_5"
+    assert second["narration_provider"] == "ElevenLabs"
+    assert second["narration_model_used"] == "eleven_multilingual_v2"
+
+
 def test_long_voiceover_requests_narration_revision(tmp_path):
     original_request = narration_agent._json_request
     original_headers = narration_agent._elevenlabs_headers
@@ -95,6 +114,51 @@ def test_long_voiceover_requests_narration_revision(tmp_path):
         narration_agent._json_request = original_request
         narration_agent._elevenlabs_headers = original_headers
     assert "12.0s" in result["narration_feedback"]
+    assert result["narration_timing_attempts"] == 1
+    assert result["narration_target_words"] > 0
+
+
+def test_hindi_language_is_sent_to_elevenlabs(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_request(url, payload, _headers):
+        calls.append((url, payload))
+        return {"audio_base64": base64.b64encode(b"audio").decode(), "alignment": alignment_for(payload["text"])}
+
+    monkeypatch.setattr(narration_agent, "_json_request", fake_request)
+    monkeypatch.setattr(narration_agent, "_elevenlabs_headers", lambda: {})
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "hindi-voice")
+    state = {
+        "topic": "Raja aur cuha", "duration": "10 seconds", "language": "Hindi",
+        "parsed_requirements": {"language": "English"},
+        "output_dir": str(tmp_path), "narration_script": "राजा और चूहा मिले।",
+    }
+    narration_agent.create_narration(state)
+    assert calls[0][1]["language_code"] == "hi"
+    assert calls[0][1]["text"] == "राजा और चूहा मिले।"
+    assert "/hindi-voice/with-timestamps" in calls[0][0]
+
+
+def test_overlong_narration_uses_complete_audio_after_three_tts_attempts(monkeypatch, tmp_path):
+    def fake_request(_url, payload, _headers):
+        alignment = alignment_for(payload["text"])
+        alignment["character_end_times_seconds"][-1] = 12
+        return {"audio_base64": base64.b64encode(b"fake mp3").decode("ascii"), "alignment": alignment}
+
+    monkeypatch.setattr(narration_agent, "_json_request", fake_request)
+    monkeypatch.setattr(narration_agent, "_elevenlabs_headers", lambda: {})
+    result = narration_agent.create_narration({
+        "topic": "short", "duration": "10 seconds", "output_dir": str(tmp_path),
+        "narration_script": "A complete short story.", "narration_timing_attempts": 2,
+    })
+
+    assert result["actual_narration_seconds"] == 12
+    assert result["narration_feedback"] == ""
+    assert result["narration_timing_attempts"] == 3
+    assert result["narration_target_words"] == 0
+    assert "12.0s" in result["warnings"][-1]
+    assert "10s" in result["warnings"][-1]
+    assert Path(result["narration_file"]).is_file()
 
 
 def test_requires_story_or_storyboard():

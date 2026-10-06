@@ -137,28 +137,48 @@ demo/                    Example generated video
 
 - **Orchestration:** LangGraph with human-review interrupts and SQLite checkpoints
 - **API and UI:** FastAPI, Uvicorn, and a dependency-free HTML/CSS/JavaScript frontend
-- **LLMs:** Ollama/LangChain Ollama, Hugging Face Inference, Gemini, or Groq
-- **Media generation:** Magnific image/video APIs and ElevenLabs narration
+- **LLMs:** with `MODEL_PROVIDER=auto`, each stage tries the chain in `config/models.yml` (OpenAI gpt-5-nano first, then free Groq and Gemini, local Ollama last) and skips providers that are rate limited or have no key. Single-provider modes remain: Ollama, Hugging Face Inference, Gemini, or Groq
+- **Media generation:** Choose narration, image, and video models independently from ElevenLabs, Magnific, and fal.ai
 - **Media processing:** FFmpeg, ffprobe, and Pillow
 - **Storage:** local artifacts with optional MinIO publishing
 - **Configuration:** YAML plus environment variables loaded by python-dotenv
 
 ## Parallel processing
 
-The pipeline uses Python's standard-library `ThreadPoolExecutor` for the network-bound generation stages:
+Speed and film-quality switches live in `config/pipeline.yml`. The pipeline uses Python's standard-library `ThreadPoolExecutor` for the network-bound stages:
 
-- **Shot images:** `IMAGE_GENERATION_WORKERS` defaults to 2 and is clamped to 1–4. Independent shots run concurrently; shots with `previous_shot_id` continuity dependencies wait for their predecessor.
-- **Shot-image QA:** vision reviews reuse `IMAGE_GENERATION_WORKERS` (default 2). Reviews execute concurrently, while `pool.map` preserves approved-shot order for deterministic retries and evaluation records.
-- **Shot videos:** `VIDEO_GENERATION_WORKERS` defaults to 3 and is clamped to 1–4. Independent shot-video jobs run concurrently, while retries and FFmpeg fallback remain isolated per shot.
+- **Planning:** visual beats are derived from the approved scene actions in code (`visual_beats_mode`), and the advisory narration, scene, and director reviewers are off by default. Planning after the story takes three model calls: narration, scenes, and shots.
+- **Reference package:** character sheets start in the background as soon as the story is approved, while narration and planning run. Location plates and any remaining sheets render concurrently; the mood board follows.
+- **Shot images:** `images.workers` (default 4, overridable with `IMAGE_GENERATION_WORKERS`, clamped to 1–8). With `continuity_reference: scene_anchor`, every later shot in a scene references the scene's first shot, so a scene renders in two parallel waves instead of one shot at a time.
+- **Shot-image QA and motion planning:** reviews and per-shot motion plans run concurrently, while preserving approved-shot order for deterministic retries and evaluation records.
+- **Shot videos:** `VIDEO_GENERATION_WORKERS` defaults to 5 for fal.ai (cap 5) and 3 for Magnific (cap 4). Logs report upload, provider wait, download, and probe durations per clip.
+- **Sound bed:** scene ambience and an instrumental music bed (ElevenLabs) render in the background while shot videos generate.
 
-These are Python threads for overlapping network and model I/O, not CPU-bound multiprocessing. The rest of the LangGraph workflow remains sequential because each stage consumes the previous stage's validated output.
+These are Python threads for overlapping network and model I/O, not CPU-bound multiprocessing.
+
+## Cost control
+
+Set in `config/pipeline.yml` under `budget`:
+
+- **Spending cap:** every paid call (images, videos, narration, routed LLM calls, and priced sound) is recorded in a per-video cost ledger. A call that would pass `max_usd_per_video` is not started. A redo then keeps the current image, a video falls back to free FFmpeg camera motion, and a first-time image that cannot be afforded stops the run with a clear warning. The API response reports `spent_usd`, `budget_usd`, and the full `cost_ledger`.
+- **Redo limit:** automatic redos (image QA, video validation, timeline, final judge) are limited per shot (`max_paid_redos_per_shot`, default 1 image and 1 video). Your own regenerate requests are not limited but count toward the budget.
+- **Resume instead of resubmit:** fal and Magnific job IDs are saved next to the output file (`*.job.json`). After a timeout the next attempt waits for the same job instead of paying for a new one.
+- **No retries of permanent failures:** content-policy, invalid-request (HTTP 400/401/403/404/413/422), and budget errors stop retrying immediately; rate limits, outages, and timeouts are still retried.
+
+## Consistency and finishing
+
+- **One visual style:** the resolved style (default `cinematic storybook illustration`) is used by character sheets, location plates, the mood board, shots, and QA.
+- **References per shot:** the character sheets of every character named in the shot, the scene's first shot, and an empty background plate of the location (`images.max_reference_images` per provider).
+- **Shot grammar:** about one shot per 5 seconds (`shot_grammar.target_shot_seconds`), distinct actions per shot, and varied framing within a scene.
+- **Mix and grade:** ambience and music duck under narration, the whole picture gets one colour grade (`finishing.color_grade`), and the film fades in and out.
 
 ## Requirements
 
 - Python 3.10+
 - FFmpeg and ffprobe
 - Ollama with text and vision models
-- Magnific API key for image/video generation
+- Magnific API key when Magnific is selected for image/video generation
+- fal.ai API key when fal.ai is selected for image/video generation
 - ElevenLabs API key for narration
 - MinIO only when externally reachable source media is required
 
@@ -178,6 +198,26 @@ ollama pull qwen2.5:3b-instruct
 ollama pull qwen2.5vl:3b
 ollama serve
 ```
+
+When updating an existing checkout, install the new fal.ai client dependency:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Generation providers
+
+The web composer has separate narration, image, and video model selectors. Options come from `GET /api/model-catalog` and show indicative public API rates with their billing units. Image rates change between Standard (1K) and High (2K) output quality. Magnific video rates are shown in Magnific credits; actual charges depend on the provider's billing plan.
+
+`POST /api/create-video` accepts `narration_model`, `image_model`, and `video_model` IDs from that catalog. The default models are ElevenLabs Flash v2.5, Magnific Nano Banana Pro Flash, and Magnific Kling 2.6. Image and video selections can use different providers in one run. Existing callers can keep sending `image_provider: "magnific"` or `"fal"` to choose both image and video models together. If either new image or video field is present, the other omitted stage uses its default. The CLI still prompts for the legacy combined provider.
+
+To use fal.ai, set its key in `.env`:
+
+```dotenv
+FAL_KEY=your_fal_key
+```
+
+Fal uses Nano Banana Pro for images and Kling 2.6 Pro for video clips through fal.ai. The key is validated before generation starts. A fal.ai failure does not retry through Magnific; the existing local FFmpeg motion fallback may be used if video generation fails. Fal video uploads source images directly, so it does not need the MinIO public endpoint used by Magnific.
 
 ## MinIO and Cloudflare Tunnel
 
@@ -225,6 +265,14 @@ Open [http://127.0.0.1:8001](http://127.0.0.1:8001), enter a story prompt, and s
 source .venv/bin/activate
 python -m video_automation.main
 ```
+
+The CLI saves progress after each graph step. If a run stops because of an error or you close the terminal, fix the cause and continue the latest run with:
+
+```bash
+python -m video_automation.main --resume
+```
+
+Use `--resume THREAD_ID` to continue a specific run; the CLI prints its run ID when it starts. A failed step may run again, but completed steps remain in the SQLite checkpoint. Runs started before CLI checkpointing was added cannot be resumed.
 
 ## Tests
 
