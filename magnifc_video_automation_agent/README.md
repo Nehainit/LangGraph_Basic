@@ -1,48 +1,12 @@
-# Magnific Video Automation Agent
+# Text-to-Video Multi-Agent System
 
-**Status: Active Development**
+**Status: Active Development — Version 4**
 
-Core pipeline is functional. Current work focuses on improving generation quality, video animation quality, evaluation, retry logic, and production readiness.
+A LangGraph pipeline that turns a one-line story prompt into a narrated, subtitled short film. Agents write the story and narration, plan scenes and shots, draw consistent character and location references, and generate a storyboard. A person reviews that storyboard once; the pipeline then animates every shot, validates the clips, and cuts the final film.
 
-A LangGraph pipeline that turns a story prompt into a narrated short video. It plans the story and shots, generates reference art and scene media, validates each stage, assembles a rough cut, and produces the final edit.
+Images and clips are generated on **fal.ai** by default, with **Magnific** as an automatic per-call fallback. Planning and QA run on cloud LLMs (`gpt-5-nano` first) through a provider chain, with local Ollama as an optional last resort.
 
-## Demo
-
-### Version 1 — narrated storyboard
-
-<p align="center">
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/robot-story.mp4">
-    <img src="demo/robot-story-poster.jpg" width="280" alt="Robot story video preview">
-  </a>
-  <br>
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/robot-story.mp4"><strong>▶ Watch the 17-second 1080×1920 demo</strong></a>
-</p>
-
-### Version 2 — Magnific/Kling animated shots
-
-<p align="center">
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-2-raja-rani.mp4">
-    <img src="demo/version-2-raja-rani-poster.jpg" width="280" alt="Raja and Rani animated story preview">
-  </a>
-  <br>
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-2-raja-rani.mp4"><strong>▶ Watch the 30-second animated Raja–Rani example</strong></a>
-</p>
-
-This run uses three real `kling-v2-6-pro` image-to-video clips with narration and FFmpeg assembly.
-
-### Version 3 — resilient multi-agent pipeline
-
-<p align="center">
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-3-ganesha.mp4">
-    <img src="demo/version-3-ganesha-poster.jpg" width="280" alt="Ganesha story final reel preview">
-  </a>
-  <br>
-  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-3-ganesha.mp4"><strong>▶ Watch the 25-second validated Ganesha example</strong></a>
-</p>
-
-This run demonstrates the complete Version 3 planning, visual QA, narration, timeline, subtitle, and final-edit path. Magnific failed during this run, so the final reel transparently demonstrates the FFmpeg motion fallback rather than AI character animation.
-
-### Version 4 — fal.ai, storyboard review, and clip carousel
+## Demo — Version 4 (current)
 
 <p align="center">
   <a href="demo/version-4-rabbit-turtle.mp4">
@@ -81,18 +45,59 @@ All 7 frames (fal `nano-banana-pro`) and all 7 clips (fal Kling 2.6 Pro) were ge
 
 Image QA (`gpt-5-nano`) checks each frame once and shows its findings as **Check** badges; it advises the reviewer instead of silently paying for redraws. Once the storyboard is approved it is final — later stages animate it as-is.
 
+## Earlier versions
+
+<details>
+<summary>Version 1–3 demos</summary>
+
+#### Version 1 — narrated storyboard
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/robot-story.mp4">
+    <img src="demo/robot-story-poster.jpg" width="280" alt="Robot story video preview">
+  </a>
+  <br>
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/robot-story.mp4"><strong>▶ Watch the 17-second 1080×1920 demo</strong></a>
+</p>
+
+#### Version 2 — Magnific/Kling animated shots
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-2-raja-rani.mp4">
+    <img src="demo/version-2-raja-rani-poster.jpg" width="280" alt="Raja and Rani animated story preview">
+  </a>
+  <br>
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-2-raja-rani.mp4"><strong>▶ Watch the 30-second animated Raja–Rani example</strong></a>
+</p>
+
+This run uses three real `kling-v2-6-pro` image-to-video clips with narration and FFmpeg assembly.
+
+#### Version 3 — resilient multi-agent pipeline
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-3-ganesha.mp4">
+    <img src="demo/version-3-ganesha-poster.jpg" width="280" alt="Ganesha story final reel preview">
+  </a>
+  <br>
+  <a href="https://raw.githubusercontent.com/Nehainit/Text_to_video_multi_agent_system/main/demo/version-3-ganesha.mp4"><strong>▶ Watch the 25-second validated Ganesha example</strong></a>
+</p>
+
+This run demonstrates the complete Version 3 planning, visual QA, narration, timeline, subtitle, and final-edit path. Magnific failed during this run, so the final reel transparently demonstrates the FFmpeg motion fallback rather than AI character animation.
+
+</details>
+
 ## Pipeline versions
 
 | Version | Video workflow | Status |
 |---|---|---|
-| **Version 1 — narrated storyboard** | Generates still story images, narration, and an FFmpeg-assembled reel. | Baseline represented by the robot demo above. |
+| **Version 1 — narrated storyboard** | Generates still story images, narration, and an FFmpeg-assembled reel. | [Robot story demo](demo/robot-story.mp4). |
 | **Version 2 — animated shots** | Adds per-shot motion plans and Magnific/Kling image-to-video generation, with FFmpeg camera movement as a continuity fallback when animation is unavailable. | [Raja–Rani animated example](demo/version-2-raja-rani.mp4). |
 | **Version 3 — resilient multi-agent pipeline** | Adds deterministic validators, visual QA, HITL checkpoints, targeted per-shot retries, concurrent media workers, checkpoint/resume, and MinIO artifact publishing. | [Ganesha fallback example](demo/version-3-ganesha.mp4). |
 | **Version 4 — fal.ai + storyboard review** | fal.ai by default with per-call Magnific fallback, a single human storyboard checkpoint in a cover-flow carousel, advisory image QA, and a clip carousel on the finished film. | **Current — Active Development.** [Rabbit–turtle example](demo/version-4-rabbit-turtle.mp4). |
 
 ## Engineering snapshot
 
-| **281** automated tests | **24** graph stages | **4** judge retry routes | **2 + 2 + 3** image / QA / video workers |
+| **281** automated tests | **24** graph stages | **4** judge retry routes | **4 + 4 + 5** image / QA / video workers |
 |---:|---:|---:|---:|
 | **3** aspect ratios | **4** LLM providers | **SQLite** checkpoint + resume | **Per-shot** regeneration |
 
@@ -129,40 +134,37 @@ The platform figures cover video only — consistent start frames, narration, su
 
 ```mermaid
 flowchart TB
-    U["Story prompt + controls"] --> API["FastAPI + browser UI"] --> G["LangGraph orchestrator"]
+    U["Story prompt + controls"] --> API["FastAPI + browser studio"] --> G["LangGraph orchestrator"]
     CP[("SQLite checkpoints")] <-. "persist + resume" .-> G
 
-    subgraph PRE["Pre-production agents"]
+    subgraph PRE["Pre-production — automatic"]
         direction LR
-        S["Safety + Story"] --> HS{"Story HITL"}
-        HS --> N["Narration script + voice"]
+        S["Safety + Story"] --> N["Narration script + voice"]
         N --> P["Scene + visual + shot planning"]
-        P --> HP{"Planning HITL gates"}
-        HP --> D["Director critique + image prompts"]
+        P --> D["Director critique + image prompts"]
     end
 
-    subgraph GEN["Media generation"]
+    subgraph GEN["Media generation — fal.ai, Magnific fallback"]
         direction LR
-        R["Character + mood references"] --> I["Shot images<br/>ThreadPool: 2 workers"]
-        I --> IQ["Image QA<br/>ThreadPool: 2 workers"] --> HV{"Storyboard HITL"}
-        HV --> M["Motion plans"] --> V["Shot videos<br/>ThreadPool: 3 workers"]
+        R["Character sheets, location plates, mood board"] --> I["Shot images<br/>4 workers"]
+        I --> IQ["Advisory image QA<br/>4 workers"] --> HV{"Storyboard review<br/>the one human checkpoint"}
+        HV --> M["Motion plans<br/>approved frames animated as-is"] --> V["Shot videos<br/>5 workers on fal"]
     end
 
     subgraph POST["Deterministic validation + assembly"]
         direction LR
         DV["Video validator"] --> T["Edit timeline"] --> RC["FFmpeg rough cut"]
-        RC --> J["Combined video judge"] --> SUB["Subtitles"] --> F["Final edit"]
+        RC --> J["Combined video judge"] --> SUB["Subtitles + sound bed"] --> F["Final edit"]
     end
 
     G --> S
     D --> R
     V --> DV
 
-    IQ -. "failed shots" .-> I
-    HV -. "selected regeneration" .-> I
+    P -. "planning checks auto-retry" .-> P
+    HV -. "redraw shots with notes" .-> I
     DV -. "technical retry" .-> V
     T -. "clip-duration retry" .-> V
-    J -. "source image" .-> I
     J -. "motion plan" .-> M
     J -. "video generation" .-> V
     J -. "edit timeline" .-> T
@@ -177,11 +179,13 @@ flowchart TB
     A -. "optional publishing" .-> O[("MinIO")]
 ```
 
-Human review checkpoints and SQLite persistence allow interrupted runs to be reviewed or resumed. Detailed agent contracts are in [`docs/agents`](docs/agents/README.md).
+Internal planning checkpoints are answered automatically (retry, then revise upstream); the storyboard is the only point where the run waits for a person. SQLite persistence lets an interrupted run be resumed from its last checkpoint. Detailed agent contracts are in [`docs/agents`](docs/agents/README.md).
 
 ## Interface
 
-![Softframe text-to-video interface](demo/softframe-ui.png)
+![Studio storyboard review with QA check badges](demo/version-4/studio-storyboard.jpg)
+
+The studio is a single page: write the idea, pick a style and format, review the storyboard in a cover-flow carousel (leave a note on any shot to redraw it), then watch the film and browse its clips. See the [walkthrough above](#demo--version-4-current).
 
 ## Project structure
 
@@ -204,10 +208,10 @@ demo/                    Example generated video
 
 ## Technology stack
 
-- **Orchestration:** LangGraph with human-review interrupts and SQLite checkpoints
+- **Orchestration:** LangGraph with one human storyboard checkpoint, automatic internal checkpoints, and SQLite checkpoints
 - **API and UI:** FastAPI, Uvicorn, and a dependency-free HTML/CSS/JavaScript frontend
 - **LLMs:** with `MODEL_PROVIDER=auto`, each stage tries the chain in `config/models.yml` (OpenAI gpt-5-nano first, then free Groq and Gemini, local Ollama last) and skips providers that are rate limited or have no key. Single-provider modes remain: Ollama, Hugging Face Inference, Gemini, or Groq
-- **Media generation:** Choose narration, image, and video models independently from ElevenLabs, Magnific, and fal.ai
+- **Media generation:** fal.ai (Nano Banana Pro images, Kling 2.6 Pro video) by default, Magnific as automatic fallback, ElevenLabs for narration, ambience, and music
 - **Media processing:** FFmpeg, ffprobe, and Pillow
 - **Storage:** local artifacts with optional MinIO publishing
 - **Configuration:** YAML plus environment variables loaded by python-dotenv
@@ -219,7 +223,7 @@ Speed and film-quality switches live in `config/pipeline.yml`. The pipeline uses
 - **Planning:** visual beats are derived from the approved scene actions in code (`visual_beats_mode`), and the advisory narration, scene, and director reviewers are off by default. Planning after the story takes three model calls: narration, scenes, and shots.
 - **Reference package:** character sheets start in the background as soon as the story is approved, while narration and planning run. Location plates and any remaining sheets render concurrently; the mood board follows.
 - **Shot images:** `images.workers` (default 4, overridable with `IMAGE_GENERATION_WORKERS`, clamped to 1–8). With `continuity_reference: scene_anchor`, every later shot in a scene references the scene's first shot, so a scene renders in two parallel waves instead of one shot at a time.
-- **Shot-image QA and motion planning:** reviews and per-shot motion plans run concurrently, while preserving approved-shot order for deterministic retries and evaluation records.
+- **Shot-image QA and motion planning:** reviews and per-shot motion plans run concurrently, while preserving approved-shot order. Image QA makes one advisory pass (`max_retries: 0`) and never redraws on its own.
 - **Shot videos:** `VIDEO_GENERATION_WORKERS` defaults to 5 for fal.ai (cap 5) and 3 for Magnific (cap 4). Logs report upload, provider wait, download, and probe durations per clip.
 - **Sound bed:** scene ambience and an instrumental music bed (ElevenLabs) render in the background while shot videos generate.
 
@@ -230,7 +234,7 @@ These are Python threads for overlapping network and model I/O, not CPU-bound mu
 Set in `config/pipeline.yml` under `budget`:
 
 - **Spending cap:** every paid call (images, videos, narration, routed LLM calls, and priced sound) is recorded in a per-video cost ledger. A call that would pass `max_usd_per_video` is not started. A redo then keeps the current image, a video falls back to free FFmpeg camera motion, and a first-time image that cannot be afforded stops the run with a clear warning. The API response reports `spent_usd`, `budget_usd`, and the full `cost_ledger`.
-- **Redo limit:** automatic redos (image QA, video validation, timeline, final judge) are limited per shot (`max_paid_redos_per_shot`, default 1 image and 1 video). Your own regenerate requests are not limited but count toward the budget.
+- **Redo limit:** automatic redos (video validation, timeline, final judge) are limited per shot (`max_paid_redos_per_shot`, default 1 image and 1 video). Your own regenerate requests are not limited but count toward the budget.
 - **Resume instead of resubmit:** fal and Magnific job IDs are saved next to the output file (`*.job.json`). After a timeout the next attempt waits for the same job instead of paying for a new one.
 - **No retries of permanent failures:** content-policy, invalid-request (HTTP 400/401/403/404/413/422), and budget errors stop retrying immediately; rate limits, outages, and timeouts are still retried.
 
@@ -245,11 +249,11 @@ Set in `config/pipeline.yml` under `budget`:
 
 - Python 3.10+
 - FFmpeg and ffprobe
-- Ollama with text and vision models
-- Magnific API key when Magnific is selected for image/video generation
-- fal.ai API key when fal.ai is selected for image/video generation
-- ElevenLabs API key for narration
-- MinIO only when externally reachable source media is required
+- fal.ai API key (`FAL_KEY`) — default image and video provider
+- An LLM key for `MODEL_PROVIDER=auto` — OpenAI (`gpt-5-nano`) first; Groq or Gemini work as free fallbacks
+- ElevenLabs API key for narration; enable the `sound_generation` and `music_generation` permissions for ambience and music
+- Optional: Magnific API key for the automatic fallback, plus MinIO with a public endpoint for Magnific video
+- Optional: Ollama, only as the last LLM fallback or for `MODEL_PROVIDER=ollama`
 
 ## Setup
 
@@ -260,7 +264,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Add your API keys to `.env`, then install the default local models:
+Add your API keys to `.env` (it is git-ignored — never commit it). Ollama is optional; if you want it as the last fallback:
 
 ```bash
 ollama pull qwen2.5:3b-instruct
@@ -268,17 +272,11 @@ ollama pull qwen2.5vl:3b
 ollama serve
 ```
 
-When updating an existing checkout, install the new fal.ai client dependency:
-
-```bash
-pip install -r requirements.txt
-```
-
 ## Generation providers
 
 The web composer has separate narration, image, and video model selectors. Options come from `GET /api/model-catalog` and show indicative public API rates with their billing units. Image rates change between Standard (1K) and High (2K) output quality. Magnific video rates are shown in Magnific credits; actual charges depend on the provider's billing plan.
 
-`POST /api/create-video` accepts `narration_model`, `image_model`, and `video_model` IDs from that catalog. The default models are ElevenLabs Flash v2.5, Magnific Nano Banana Pro Flash, and Magnific Kling 2.6. Image and video selections can use different providers in one run. Existing callers can keep sending `image_provider: "magnific"` or `"fal"` to choose both image and video models together. If either new image or video field is present, the other omitted stage uses its default. The CLI still prompts for the legacy combined provider.
+`POST /api/create-video` accepts `narration_model`, `image_model`, and `video_model` IDs from that catalog. The studio and API default to fal.ai (`image_provider: "fal"`): ElevenLabs Flash v2.5, fal Nano Banana Pro, and fal Kling 2.6 Pro. Image and video selections can use different providers in one run. Existing callers can keep sending `image_provider: "magnific"` or `"fal"` to choose both image and video models together. If either new image or video field is present, the other omitted stage uses its default. The CLI still prompts for the legacy combined provider.
 
 To use fal.ai, set its key in `.env`:
 
@@ -286,11 +284,11 @@ To use fal.ai, set its key in `.env`:
 FAL_KEY=your_fal_key
 ```
 
-Fal uses Nano Banana Pro for images and Kling 2.6 Pro for video clips through fal.ai. The key is validated before generation starts. A fal.ai failure does not retry through Magnific; the existing local FFmpeg motion fallback may be used if video generation fails. Fal video uploads source images directly, so it does not need the MinIO public endpoint used by Magnific.
+Fal uses Nano Banana Pro for images and Kling 2.6 Pro for video clips. When a fal.ai image or video call fails, that one shot is retried on Magnific (Nano Banana Pro Flash / Kling 2.6), and each artifact records both the requested provider and `provider_used`. If Magnific also fails, a video shot falls back to free FFmpeg camera motion. Fal uploads source images directly, so only the Magnific video fallback needs the MinIO public endpoint below.
 
 ## MinIO and Cloudflare Tunnel
 
-Magnific cannot download an image from `localhost`. The backend therefore uploads each approved storyboard frame to local MinIO, creates a time-limited presigned URL using the public endpoint, and sends that HTTPS URL to Magnific/Kling for image-to-video generation.
+Only needed for the **Magnific video fallback** — the default fal.ai path does not use it. Magnific cannot download an image from `localhost`. The backend therefore uploads each approved storyboard frame to local MinIO, creates a time-limited presigned URL using the public endpoint, and sends that HTTPS URL to Magnific/Kling for image-to-video generation.
 
 ```text
 Backend → localhost:9000 (upload to MinIO)
@@ -326,7 +324,14 @@ source .venv/bin/activate
 python -m video_automation.backend
 ```
 
-Open [http://127.0.0.1:8001](http://127.0.0.1:8001), enter a story prompt, and start generation. Artifacts are written under `outputs/<thread-id>/`.
+Open [http://127.0.0.1:8001](http://127.0.0.1:8001), enter a story prompt, and start generation. After a few minutes the storyboard appears for review: animate it, or leave notes on shots to redraw them first. Artifacts are written under `outputs/<thread-id>/`.
+
+## Known limitations
+
+- **Film length follows the narration.** The script targets about 2.2 words per second of the requested length; the final film is as long as the spoken narration.
+- **Combined video judge** currently runs only with `MODEL_PROVIDER=ollama`; with `auto` it is skipped and the validated rough cut continues.
+- **5-second clip billing:** Kling bills whole 5-second clips, so shots shorter than that pay for footage the edit trims away.
+- **Ambience and music** need the ElevenLabs `sound_generation` / `music_generation` permissions; without them the film keeps narration only and lists a production note.
 
 ## Run the interactive CLI
 
@@ -349,4 +354,4 @@ Use `--resume THREAD_ID` to continue a specific run; the CLI prints its run ID w
 .venv/bin/python -m pytest -q
 ```
 
-The suite currently contains 195 tests.
+The suite currently contains 281 tests and runs in about 3 seconds. Every provider call is mocked, and `tests/conftest.py` swaps in dummy fal.ai and Magnific keys so a test can never bill a real account.
