@@ -42,19 +42,88 @@ This run uses three real `kling-v2-6-pro` image-to-video clips with narration an
 
 This run demonstrates the complete Version 3 planning, visual QA, narration, timeline, subtitle, and final-edit path. Magnific failed during this run, so the final reel transparently demonstrates the FFmpeg motion fallback rather than AI character animation.
 
+### Version 4 — fal.ai, storyboard review, and clip carousel
+
+<p align="center">
+  <a href="demo/version-4-rabbit-turtle.mp4">
+    <img src="demo/version-4-rabbit-turtle-poster.jpg" width="280" alt="Rabbit and turtle race final reel preview">
+  </a>
+  <br>
+  <a href="demo/version-4-rabbit-turtle.mp4"><strong>▶ Watch the 17-second 1080×1920 rabbit-and-turtle film</strong></a>
+</p>
+
+Prompt: *"A rabbit challenges a quiet turtle to a race through the forest. Slow and steady wins the day."* — illustrated style, portrait, 30 s requested.
+
+All 7 frames (fal `nano-banana-pro`) and all 7 clips (fal Kling 2.6 Pro) were generated on fal.ai, with Magnific kept as an automatic per-call fallback. The run pauses once for a human: the **storyboard review**, the last cheap step before paid video.
+
+**Storyboard the reviewer approved**
+
+<p align="center"><img src="demo/version-4/storyboard.jpg" alt="Seven storyboard frames of the rabbit and turtle race"></p>
+
+**Animated clips** (540p previews):
+<p align="center">
+  <a href="demo/version-4/clips/shot-01.mp4">Shot 1</a> ·
+  <a href="demo/version-4/clips/shot-02.mp4">Shot 2</a> ·
+  <a href="demo/version-4/clips/shot-03.mp4">Shot 3</a> ·
+  <a href="demo/version-4/clips/shot-04.mp4">Shot 4</a> ·
+  <a href="demo/version-4/clips/shot-05.mp4">Shot 5</a> ·
+  <a href="demo/version-4/clips/shot-06.mp4">Shot 6</a> ·
+  <a href="demo/version-4/clips/shot-07.mp4">Shot 7</a>
+</p>
+
+**Studio walkthrough**
+
+| 1. Write the idea | 2. Review the storyboard |
+|---|---|
+| <img src="demo/version-4/studio-compose.jpg" alt="Studio compose screen"> | <img src="demo/version-4/studio-storyboard.jpg" alt="Storyboard carousel with QA check badges"> |
+| **3. Film ready** | **4. Browse the clips** |
+| <img src="demo/version-4/studio-result.jpg" alt="Finished film screen"> | <img src="demo/version-4/studio-clips.jpg" alt="Clip carousel on the result screen"> |
+
+Image QA (`gpt-5-nano`) checks each frame once and shows its findings as **Check** badges; it advises the reviewer instead of silently paying for redraws. Once the storyboard is approved it is final — later stages animate it as-is.
+
 ## Pipeline versions
 
 | Version | Video workflow | Status |
 |---|---|---|
 | **Version 1 — narrated storyboard** | Generates still story images, narration, and an FFmpeg-assembled reel. | Baseline represented by the robot demo above. |
 | **Version 2 — animated shots** | Adds per-shot motion plans and Magnific/Kling image-to-video generation, with FFmpeg camera movement as a continuity fallback when animation is unavailable. | [Raja–Rani animated example](demo/version-2-raja-rani.mp4). |
-| **Version 3 — resilient multi-agent pipeline** | Adds deterministic validators, visual QA, HITL checkpoints, targeted per-shot retries, concurrent media workers, checkpoint/resume, and MinIO artifact publishing. | **Current — Active Development.** [Ganesha fallback example](demo/version-3-ganesha.mp4). |
+| **Version 3 — resilient multi-agent pipeline** | Adds deterministic validators, visual QA, HITL checkpoints, targeted per-shot retries, concurrent media workers, checkpoint/resume, and MinIO artifact publishing. | [Ganesha fallback example](demo/version-3-ganesha.mp4). |
+| **Version 4 — fal.ai + storyboard review** | fal.ai by default with per-call Magnific fallback, a single human storyboard checkpoint in a cover-flow carousel, advisory image QA, and a clip carousel on the finished film. | **Current — Active Development.** [Rabbit–turtle example](demo/version-4-rabbit-turtle.mp4). |
 
 ## Engineering snapshot
 
-| **195** automated tests | **24** graph stages | **4** judge retry routes | **2 + 2 + 3** image / QA / video workers |
+| **281** automated tests | **24** graph stages | **4** judge retry routes | **2 + 2 + 3** image / QA / video workers |
 |---:|---:|---:|---:|
 | **3** aspect ratios | **4** LLM providers | **SQLite** checkpoint + resume | **Per-shot** regeneration |
+
+## Cost and time per film
+
+Measured on the Version 4 rabbit–turtle run (7 shots, 1080×1920, fal.ai), from the pipeline's cost ledger:
+
+| Item | Count | Unit price | Cost |
+|---|---:|---:|---:|
+| Video clips — fal Kling 2.6 Pro | 7 | $0.35 (5 s × $0.07) | **$2.45** |
+| Images — fal Nano Banana Pro (7 frames, 2 character sheets, location, mood board) | 11 | $0.15 | **$1.65** |
+| Narration — ElevenLabs | 1 | — | $0.014 |
+| LLM planning and vision calls — `gpt-5-nano` | 25 | — | $0.011 |
+| **Total** | | | **≈ $4.11** |
+
+Kling bills whole 5-second clips, while these shots needed 1.4–3.2 s each, so roughly $1.30 of the video spend is trimmed away in the edit. Planning about one shot per 5 seconds of film would bring the same film to about $2.60.
+
+**Wall-clock time:** about 4 minutes from prompt to storyboard, plus about 6 minutes from approval to the final film (clips render in parallel, ~3 min each) — **~10 minutes of machine time** and one human review.
+
+### Compared with generating the same film by hand
+
+Same 7 clips at 1080p (every platform bills in 5-second blocks, so 35 s of video):
+
+| Route | Pricing model | Video for 7 clips | Hands-on time |
+|---|---|---:|---|
+| **This pipeline (fal.ai)** | Pay per use, no subscription | $2.45 (+ $1.65 images) | ~10 min machine time, one review |
+| Kling (official app) | ~40 credits per 5 s at 1080p; Pro plan ≈ $33/month | ≈ $3.05 | 1.5–3 h |
+| Magnific | 45 credits/s for Kling 2.6 at 1080p; plans ≈ $20–34/month | ≈ $1.20–1.60 | 1.5–3 h |
+| Higgsfield | ≈ 8–12.5 credits per 5 s; plans $19–129/month | ≈ $2.75–4.30 | 1.5–3 h |
+
+The platform figures cover video only — consistent start frames, narration, subtitles, and editing are extra work or extra tools. Doing it by hand is mostly time: keeping one character consistent across 7 frames, prompting each clip, and cutting voice, subtitles, and clips together typically takes 1.5–3 hours. Platform prices are third-party estimates from September–October 2026 and change often; check each platform's pricing page.
 
 ## Architecture
 

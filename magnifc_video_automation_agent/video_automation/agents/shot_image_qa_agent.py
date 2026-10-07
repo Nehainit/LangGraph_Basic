@@ -18,12 +18,19 @@ ISSUE_TYPES = {
 }
 
 
-def _review_job(job: tuple[str, str, list[str]]) -> tuple[str, dict, dict]:
+def _review_job(job: tuple[str, str, list[str]]) -> tuple[str, dict, dict | None]:
     shot_id, prompt, image_files = job
-    response, evaluation = invoke_with_images_and_evaluation(
-        "shot-image-qa", prompt, image_files, purpose="review_shot_image",
-    )
-    return shot_id, _validate_result(_parse_json(response.content), shot_id), evaluation
+    try:
+        response, evaluation = invoke_with_images_and_evaluation(
+            "shot-image-qa", prompt, image_files, purpose="review_shot_image",
+        )
+        return shot_id, _validate_result(_parse_json(response.content), shot_id), evaluation
+    except Exception as exc:
+        # QA only advises the storyboard reviewer, so a failed check must not stop the film.
+        return shot_id, {
+            "shot_id": shot_id, "approved": None, "animation_ready": None,
+            "issues": [], "retry_target": None, "qa_error": str(exc),
+        }, None
 
 
 def _validate_result(value: object, shot_id: str) -> dict:
@@ -127,15 +134,16 @@ def review_shot_images(state: AgentState) -> dict:
             max_workers=_image_worker_count(len(jobs)), thread_name_prefix="shot-image-qa",
         ) as pool:
             for shot_id, result, evaluation in pool.map(_review_job, jobs):
-                evaluation["call_number"] = len(evaluations) + 1
-                evaluations.append(evaluation)
+                if evaluation is not None:
+                    evaluation["call_number"] = len(evaluations) + 1
+                    evaluations.append(evaluation)
                 results_by_shot[shot_id] = result
 
     results = [results_by_shot[shot["shot_id"]] for shot in shots]
 
     return {
         "shot_image_qa_results": results,
-        "shot_image_qa_retry_shots": [item["shot_id"] for item in results if not item["approved"]],
+        "shot_image_qa_retry_shots": [item["shot_id"] for item in results if item["approved"] is False],
         "shot_image_qa_round": int(state.get("shot_image_qa_round", 0)) + 1,
         "shot_image_qa_pending_shots": [],
         "llm_evaluations": evaluations,

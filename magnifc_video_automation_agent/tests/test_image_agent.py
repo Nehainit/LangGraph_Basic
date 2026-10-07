@@ -316,16 +316,20 @@ def test_fal_timeout_is_retried_and_recorded(monkeypatch, tmp_path):
     stub = FalStub(TimeoutError("fal request timed out"))
     monkeypatch.setenv("FAL_KEY", "test-key")
     monkeypatch.setattr(image_agent, "fal_client", stub, raising=False)
+    monkeypatch.setattr(
+        image_agent, "_generate_reference_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("Magnific unavailable")),
+    )
 
     item = image_agent.create_visual_storyboard(state)["generated_images"][0]
 
     assert item["generation_status"] == "failed"
     assert item["generation_attempt"] == 3
-    assert item["error"] == "fal request timed out"
+    assert item["error"] == "fal.ai failed (fal request timed out); Magnific fallback failed (Magnific unavailable)"
     assert len(stub.calls) == 3
 
 
-def test_fal_failure_does_not_fall_back_to_magnific_and_records_metadata(monkeypatch, tmp_path):
+def test_fal_failure_falls_back_to_magnific_and_records_metadata(monkeypatch, tmp_path):
     state = {**_shot_image_state(tmp_path, [None]), "image_provider": "fal"}
     monkeypatch.setenv("FAL_KEY", "test-key")
     monkeypatch.setattr(
@@ -334,19 +338,22 @@ def test_fal_failure_does_not_fall_back_to_magnific_and_records_metadata(monkeyp
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fal unavailable")),
         raising=False,
     )
-    monkeypatch.setattr(
-        image_agent,
-        "_generate_reference_image",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Magnific fallback is forbidden")),
-    )
+    magnific_calls = []
+
+    def magnific(_prompt, _size, image_file, references, **_kwargs):
+        magnific_calls.append(list(references))
+        image_file.write_bytes(b"image")
+
+    monkeypatch.setattr(image_agent, "_generate_reference_image", magnific)
 
     item = image_agent.create_visual_storyboard(state)["generated_images"][0]
 
-    assert item["generation_status"] == "failed"
-    assert item["error"] == "fal unavailable"
-    assert item["generation_attempt"] == 3
+    assert item["generation_status"] == "success"
+    assert len(magnific_calls) == 1
+    # The requested provider stays fal so a later redraw does not treat this image as stale.
     assert item["provider"] == "fal"
-    assert item["model_used"] == "fal-ai/nano-banana-pro"
+    assert item["provider_used"] == "magnific"
+    assert item["model_used"] == "nano-banana-pro-flash"
 
 
 def test_fal_success_records_reference_appropriate_model(monkeypatch, tmp_path):
@@ -1046,3 +1053,25 @@ def test_prefetched_character_sheets_are_reused_by_the_reference_package(tmp_pat
         assert len(calls) == 2  # one prefetched sheet and the mood board
 
     with_fake_images(run)
+
+
+def test_sequence_words_in_continuity_notes_do_not_fail_the_image_prompt():
+    shot = {
+        "shot_id": "shot-005", "scene_id": "scene-002", "visual_beat_ids": ["vb-005"],
+        "source_segment_ids": ["segment-005"], "characters_present": [], "location_id": "location-001",
+        "visual_action": "A rabbit sleeps under a tree", "visual_focus": "the sleeping rabbit",
+        "framing": "wide shot", "camera_angle": "eye level", "composition": "rabbit at left third",
+        "emotion": "calm", "continuity_in": "Rabbit is tired after sprinting.",
+        "continuity_out": "Scene resolves: rabbit speeds, then naps; turtle continues at a steady pace.",
+    }
+    result = image_agent.build_image_prompts({
+        "topic": "Race", "shot_plan": [shot],
+        "production_bible": {
+            "visual_style": "Storybook illustration",
+            "locations": [{"location_id": "location-001", "description": "forest path"}],
+        },
+    })
+    prompt = result["image_prompt_requests"][0]["image_prompt"]
+
+    assert "Rabbit is tired after sprinting." in prompt
+    assert "then naps" not in prompt

@@ -52,25 +52,83 @@ class FakeGraph:
         }
 
 
-def test_web_request_auto_advances_review_checkpoints(monkeypatch):
+def test_web_story_then_visual_storyboard_flow(monkeypatch):
     monkeypatch.setenv("QA_MODEL", "vision-model")
     original_graph = backend.graph
     fake_graph = FakeGraph()
     backend.graph = fake_graph
     try:
         response = backend.create_video(backend.VideoRequest(topic="A funny story about Mira", duration=47, language="Hindi"))
-        assert response["status"] == "complete"
+        assert response["status"] == "visual_storyboard_review"
+        assert response["image_urls"] == ["/output/outputs/test/images/shot-001.png"]
+        assert [command.resume for command in fake_graph.commands] == [{"action": "approve", "note": ""}]
         assert fake_graph.initial_state["duration"] == "47 seconds"
         assert fake_graph.initial_state["thread_id"] == response["thread_id"]
         assert fake_graph.initial_state["quality_mode"] == "standard"
         assert fake_graph.initial_state["aspect_ratio"] == "9:16"
         assert fake_graph.initial_state["video_quality"] == "standard"
-        assert fake_graph.initial_state["image_provider"] == "magnific"
+        assert fake_graph.initial_state["image_provider"] == "fal"
+
+        response = backend.submit_visual_storyboard_review(
+            backend.VisualStoryboardReviewRequest(thread_id=response["thread_id"], action="approve")
+        )
+        assert response["status"] == "complete"
         assert response["warnings"] == ["local fallback"]
         assert response["video_url"] == "/output/outputs/test.mp4"
-        assert [command.resume for command in fake_graph.commands] == [{"action": "approve", "note": ""}] * 2
+        assert fake_graph.commands[-1].resume == {"action": "approve"}
     finally:
         backend.graph = original_graph
+
+
+def test_storyboard_approval_auto_answers_later_internal_checkpoints():
+    shot_plan_pause = {"__interrupt__": [SimpleNamespace(value={
+        "stage": "shot_plan_review",
+        "revision_reason": "Motion needs one action.",
+        "actions": ["retry", "revise_visuals"],
+    })]}
+
+    class MotionRevisionGraph:
+        def __init__(self):
+            self.commands = []
+
+        def get_state(self, _config):
+            return SimpleNamespace(next=("review_visual_storyboard",), values={})
+
+        def invoke(self, value, _config):
+            self.commands.append(value.resume)
+            if len(self.commands) == 1:
+                return shot_plan_pause
+            return {
+                "story": "Draft story.",
+                "generated_videos": [{
+                    "shot_id": "shot-001",
+                    "video_file": str(backend.ROOT / "outputs/test/videos/shot-001-c1.mp4"),
+                    "source_image_file": str(backend.ROOT / "outputs/test/images/shot-001.png"),
+                    "generation_status": "success",
+                    "provider": "magnific",
+                }],
+                "video_file": str(backend.ROOT / "outputs/test.mp4"),
+            }
+
+    original_graph = backend.graph
+    fake_graph = MotionRevisionGraph()
+    backend.graph = fake_graph
+    try:
+        response = backend.submit_visual_storyboard_review(
+            backend.VisualStoryboardReviewRequest(thread_id="thread", action="approve")
+        )
+    finally:
+        backend.graph = original_graph
+
+    assert response["status"] == "complete"
+    assert [command["action"] for command in fake_graph.commands] == ["approve", "retry"]
+    assert response["artifacts"]["clips"] == [{
+        "shot_id": "shot-001",
+        "video_url": "/output/outputs/test/videos/shot-001-c1.mp4",
+        "image_url": "/output/outputs/test/images/shot-001.png",
+        "status": "success",
+        "provider": "magnific",
+    }]
 
 
 def test_web_request_stops_repeating_the_same_review(monkeypatch):
@@ -197,8 +255,8 @@ def test_aspect_ratio_and_output_quality_are_accepted():
     assert request.video_quality == "high"
 
 
-def test_image_provider_defaults_to_magnific_and_rejects_unknown_values():
-    assert backend.VideoRequest(topic="A story").image_provider == "magnific"
+def test_image_provider_defaults_to_fal_and_rejects_unknown_values():
+    assert backend.VideoRequest(topic="A story").image_provider == "fal"
     with pytest.raises(ValueError):
         backend.VideoRequest(topic="A story", image_provider="other")
 
@@ -257,9 +315,10 @@ def test_model_defaults_legacy_mapping_and_invalid_ids():
     assert backend.VideoRequest(topic="A story").image_model is None
     assert backend.resolve_request_models(backend.VideoRequest(topic="A story")) == {
         "narration_model": "eleven_flash_v2_5",
-        "image_model": "nano-banana-pro-flash",
-        "video_model": "kling-v2-6-pro",
+        "image_model": "fal-ai/nano-banana-pro",
+        "video_model": "fal-ai/kling-video/v2.6/pro/image-to-video",
     }
+    assert backend.resolve_request_models(backend.VideoRequest(topic="A story", image_provider="magnific"))["image_model"] == "nano-banana-pro-flash"
     assert backend.resolve_request_models(backend.VideoRequest(topic="A story", image_provider="fal"))["video_model"] == "fal-ai/kling-video/v2.6/pro/image-to-video"
     assert backend.resolve_request_models(backend.VideoRequest(topic="A story", image_provider="fal", image_model="fal-ai/nano-banana-pro"))["video_model"] == "kling-v2-6-pro"
     from video_automation.model_catalog import selected_model

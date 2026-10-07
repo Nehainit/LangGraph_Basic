@@ -10,7 +10,7 @@ from video_automation.agents.editor_agent import _clip, _resolution
 from video_automation.agents.image_agent import _env, _generate_scene_video_file, _out_dir
 from video_automation.prompts import SHOT_VIDEO_GENERATION_CONFIG
 from video_automation.schema import AgentState
-from video_automation.model_catalog import selected_model
+from video_automation.model_catalog import LEGACY_PROVIDER_MODELS, selected_model
 
 
 def _video_provider(state: AgentState) -> str:
@@ -99,6 +99,26 @@ def _generate_job(args: tuple) -> tuple[dict, dict | None, str | None]:
             if is_permanent_error(exc):
                 # Content-policy, invalid-request, and budget failures repeat on every attempt.
                 break
+    provider_used = _video_provider(state)
+    if not result and provider_used == "fal":
+        # fal.ai is the default video provider; Magnific animates the shot when fal fails.
+        magnific_state = {**state, "video_model": LEGACY_PROVIDER_MODELS["magnific"]["video"]}
+        magnific_image_url = public_artifact_url(magnific_state, image_file) if os.getenv("MINIO_PUBLIC_ENDPOINT") else None
+        if magnific_image_url:
+            print(f"{prefix} fal.ai failed for {shot_id}; retrying on Magnific: {error}", flush=True)
+            try:
+                result = _generate_scene_video_file(
+                    magnific_state, scene, image_file, video_file, plan["video_prompt"], magnific_image_url,
+                    plan["negative_prompt"], float(SHOT_VIDEO_GENERATION_CONFIG["cfg_scale"]),
+                    provider_aspect_ratio, bool(SHOT_VIDEO_GENERATION_CONFIG["generate_audio"]),
+                )
+                if not Path(result).is_file() or Path(result).stat().st_size == 0:
+                    raise RuntimeError("Magnific returned an empty video asset.")
+                provider_used = "magnific"
+            except Exception as exc:
+                result, error = None, f"fal.ai: {error}; Magnific fallback: {exc}"
+        else:
+            error = f"{error}; Magnific fallback skipped: it needs MINIO_PUBLIC_ENDPOINT for a public start image"
     requested = float(plan["duration_seconds"])
     warning = None
     generated_duration = float(provider_duration)
@@ -111,8 +131,12 @@ def _generate_job(args: tuple) -> tuple[dict, dict | None, str | None]:
         except Exception as fallback_exc:
             error = f"{error}; FFmpeg fallback failed: {fallback_exc}"
     item = _record(state, shot, image_file, requested, generated_duration, attempt, result, None if result else error)
-    if result and warning:
-        item["provider"] = "ffmpeg"
+    item["provider_used"] = provider_used
+    if provider_used == "magnific":
+        item["model_used"] = LEGACY_PROVIDER_MODELS["magnific"]["video"]
+        warning = f"{shot_id} was animated on Magnific because fal.ai failed."
+    if result and warning and provider_used != "magnific":
+        item["provider"] = item["provider_used"] = "ffmpeg"
         item["model_used"] = "ffmpeg"
     candidate = None
     if state.get("quality_mode") == "refine":

@@ -2,7 +2,8 @@ version: 1
 
 shot_image_qa:
   enabled: true
-  max_retries: 2
+  # QA is advisory: it checks each frame once and the person reviewing the storyboard decides.
+  max_retries: 0
 
   system_prompt: |-
     You are the Shot Image QA Agent in an image-first video-generation pipeline.

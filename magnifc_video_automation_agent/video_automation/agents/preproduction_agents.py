@@ -237,7 +237,8 @@ def create_narration_script(state: AgentState) -> dict:
     seconds = requirements.get("duration_seconds") or _duration_seconds(state["duration"])
     language = state.get("language") or requirements.get("language") or "English"
     hindi = str(language).strip().casefold() in {"hindi", "hi"}
-    minimum, maximum = max(8, round(seconds * 1.2)), max(8, round(seconds * 1.7))
+    # Measured TTS speech runs about 2.5 words/second; aim a little under so the film fills the requested length.
+    minimum, maximum = max(8, round(seconds * 2.0)), max(8, round(seconds * 2.4))
     target_words = int(state.get("narration_target_words") or 0)
     length_instruction = (
         f"Use at most {target_words} words total across all segments; measured TTS timing requires this shorter limit."

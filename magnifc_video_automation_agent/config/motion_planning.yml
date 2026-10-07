@@ -31,7 +31,6 @@ motion_planning:
     - narration_timing
     - character_reference_ids
     - location_id
-    - image_qa_result
     - previous_approved_clip metadata if continuity is needed
 
     Example:
@@ -235,7 +234,8 @@ motion_planning:
 
     ## Revision Handling
 
-    If image QA has already approved the image, do not question the image itself.
+    The person has approved this image on the storyboard. Never question the image itself:
+    plan motion for it exactly as it is, even if it differs from the shot description.
 
 
     Example:
@@ -275,7 +275,7 @@ motion_planning:
       "revision_reason": null
     }
 
-    If the shot cannot be animated safely without changing the approved visual meaning:
+    Only if the requested motion itself cannot be animated safely (never because of what the image shows):
 
     {
       "needs_revision": true,

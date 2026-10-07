@@ -33,7 +33,7 @@ class VideoRequest(BaseModel):
     quality_mode: Literal["standard", "refine"] = "standard"
     aspect_ratio: Literal["16:9", "9:16", "1:1"] = "9:16"
     video_quality: Literal["standard", "high"] = "standard"
-    image_provider: Literal["magnific", "fal"] = "magnific"
+    image_provider: Literal["magnific", "fal"] = "fal"
     visual_style: Literal["cinematic", "illustrated", "3d_animation", "anime"] | None = None
     narration_model: str | None = None
     image_model: str | None = None
@@ -193,6 +193,16 @@ def _artifacts(result: dict) -> dict:
         "aspect_ratio": result.get("aspect_ratio", "9:16"),
         "video_quality": result.get("video_quality", "standard"),
         "video_candidates": video_candidates,
+        "clips": [
+            {
+                "shot_id": item.get("shot_id"),
+                "video_url": _output_url(item.get("video_file")),
+                "image_url": _output_url(item.get("source_image_file")),
+                "status": item.get("generation_status"),
+                "provider": item.get("provider"),
+            }
+            for item in result.get("generated_videos", [])
+        ],
         "video_validation_results": result.get("video_validation_results", []),
         "video_validation_retry_counts": result.get("video_validation_retry_counts", {}),
         "video_validation_exhausted_shots": result.get("video_validation_exhausted_shots", []),
@@ -373,6 +383,70 @@ def _graph_response(result: dict, thread_id: str) -> dict:
     }
 
 
+# The storyboard is the one checkpoint people decide on: it is the last cheap step before paid video.
+USER_REVIEW_STAGES = {"visual_storyboard_review"}
+AUTO_ACTIONS = {
+    "story_review": "approve",
+    "scene_plan_review": "retry",
+    "visual_plan_review": "retry",
+    "reference_board_review": "approve",
+    "director_plan_review": "approve",
+    "shot_plan_review": "retry",
+}
+RECOVERY_ACTIONS = {
+    "scene_plan_review": "revise_narration",
+    "visual_plan_review": "revise_scenes",
+    "shot_plan_review": "revise_visuals",
+}
+
+
+def _review_stage(review: dict) -> str:
+    if review.get("stage"):
+        return review["stage"]
+    if "image_files" in review:
+        return "visual_storyboard_review"
+    if "character_board_file" in review:
+        return "reference_board_review"
+    if "director_plan" in review:
+        return "director_plan_review"
+    return "story_review"
+
+
+def _auto_advance(result: dict, thread_id: str) -> dict:
+    """Answer internal checkpoints until the graph finishes or reaches a checkpoint for the user."""
+    config = {"configurable": {"thread_id": thread_id}}
+    retry_counts: dict[str, int] = {}
+    recovered_stages: set[str] = set()
+    for _ in range(MAX_AUTO_ADVANCE_STEPS):
+        if "__interrupt__" not in result:
+            break
+        review = result["__interrupt__"][0].value
+        if not isinstance(review, dict):
+            review = {}
+        stage = _review_stage(review)
+        if stage in USER_REVIEW_STAGES:
+            break
+        action = AUTO_ACTIONS.get(stage)
+        if not action:
+            logger.warning("AUTO-ADVANCING UNKNOWN CHECKPOINT: thread_id=%s", thread_id)
+            action = "approve"
+        if action == "retry":
+            retry_count = retry_counts.get(stage, 0)
+            if retry_count >= MAX_AUTO_RETRIES_PER_STAGE:
+                action = RECOVERY_ACTIONS.get(stage)
+                if not action or stage in recovered_stages:
+                    logger.warning("AUTO-RECOVERY STOPPED: thread_id=%s stage=%s retries=%s", thread_id, stage, retry_count)
+                    break
+                recovered_stages.add(stage)
+                logger.warning("AUTO-RECOVERY: thread_id=%s stage=%s action=%s", thread_id, stage, action)
+            else:
+                retry_counts[stage] = retry_count + 1
+        result = graph.invoke(Command(resume={"action": action, "note": review.get("revision_reason", "")}), config)
+    else:
+        logger.warning("AUTO-ADVANCE STOPPED: thread_id=%s steps=%s", thread_id, MAX_AUTO_ADVANCE_STEPS)
+    return result
+
+
 def _resume_review(thread_id: str, node: str, command: dict) -> dict:
     config = {"configurable": {"thread_id": thread_id}}
     try:
@@ -388,7 +462,7 @@ def _resume_review(thread_id: str, node: str, command: dict) -> dict:
             value = None
         else:
             raise HTTPException(status_code=404, detail="Review session not found or already completed.")
-        return _graph_response(graph.invoke(value, config), thread_id)
+        return _graph_response(_auto_advance(graph.invoke(value, config), thread_id), thread_id)
     except HTTPException:
         raise
     except UnsafeContentError as exc:
@@ -471,51 +545,7 @@ def create_video(request: VideoRequest) -> dict:
             },
             {"configurable": {"thread_id": thread_id}},
         )
-        # Auto-advance ordinary review checkpoints during unattended generation.
-        actions = {
-            "story_review": "approve",
-            "scene_plan_review": "retry",
-            "visual_plan_review": "retry",
-            "reference_board_review": "approve",
-            "director_plan_review": "approve",
-            "visual_storyboard_review": "approve",
-            "shot_plan_review": "retry",
-        }
-        recovery_actions = {
-            "scene_plan_review": "revise_narration",
-            "visual_plan_review": "revise_scenes",
-            "shot_plan_review": "revise_visuals",
-        }
-        retry_counts: dict[str, int] = {}
-        recovered_stages: set[str] = set()
-        for _ in range(MAX_AUTO_ADVANCE_STEPS):
-            if "__interrupt__" not in result:
-                break
-            review = result["__interrupt__"][0].value
-            if not isinstance(review, dict):
-                review = {}
-            stage = review.get("stage", "")
-            action = actions.get(stage)
-            if not action:
-                logger.warning("AUTO-ADVANCING UNKNOWN CHECKPOINT: thread_id=%s", thread_id)
-                action = "approve"
-            if action == "retry":
-                retry_count = retry_counts.get(stage, 0)
-                if retry_count >= MAX_AUTO_RETRIES_PER_STAGE:
-                    action = recovery_actions.get(stage)
-                    if not action or stage in recovered_stages:
-                        logger.warning("AUTO-RECOVERY STOPPED: thread_id=%s stage=%s retries=%s", thread_id, stage, retry_count)
-                        break
-                    recovered_stages.add(stage)
-                    logger.warning("AUTO-RECOVERY: thread_id=%s stage=%s action=%s", thread_id, stage, action)
-                else:
-                    retry_counts[stage] = retry_count + 1
-            result = graph.invoke(
-                Command(resume={"action": action, "note": review.get("revision_reason", "")}),
-                {"configurable": {"thread_id": thread_id}},
-            )
-        else:
-            logger.warning("AUTO-ADVANCE STOPPED: thread_id=%s steps=%s", thread_id, MAX_AUTO_ADVANCE_STEPS)
+        result = _auto_advance(result, thread_id)
         return _graph_response(result, thread_id)
     except HTTPException:
         raise

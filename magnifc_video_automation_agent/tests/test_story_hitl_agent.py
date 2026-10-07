@@ -286,7 +286,7 @@ def test_character_references_are_created_after_image_prompt_review():
     assert order == ["image_prompts", "character_sheets", "shot_images"]
 
 
-def test_failed_shot_image_qa_retries_before_storyboard_review():
+def test_flagged_shot_image_goes_to_storyboard_review_without_redraw():
     calls = {"images": 0, "qa": 0}
 
     def images(_state):
@@ -314,12 +314,15 @@ def test_failed_shot_image_qa_retries_before_storyboard_review():
         }
 
     graph = build_fake_graph(image_creator=images, shot_image_reviewer=qa)
-    config = {"configurable": {"thread_id": "shot-image-qa-loop"}}
+    config = {"configurable": {"thread_id": "shot-image-qa-advisory"}}
     graph.invoke(state(), config)
     result = graph.invoke(Command(resume={"action": "approve"}), config)
 
-    assert calls == {"images": 2, "qa": 2}
-    assert result["__interrupt__"][0].value["shot_image_qa_results"][0]["approved"] is True
+    # QA advises the reviewer instead of silently paying for redraws.
+    assert calls == {"images": 1, "qa": 1}
+    review = result["__interrupt__"][0].value
+    assert review["stage"] == "visual_storyboard_review"
+    assert review["shot_image_qa_results"][0]["approved"] is False
 
 
 def test_valid_video_routes_through_combined_judge():

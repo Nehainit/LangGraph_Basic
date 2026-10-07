@@ -82,3 +82,23 @@ def test_shot_image_qa_reviews_shots_in_parallel_and_preserves_order(monkeypatch
 
     assert [item["shot_id"] for item in result["shot_image_qa_results"]] == ["shot-001", "shot-002"]
     assert [item["call_number"] for item in result["llm_evaluations"]] == [1, 2]
+
+
+def test_failed_shot_image_qa_call_is_recorded_without_stopping_the_film(monkeypatch, tmp_path):
+    image = tmp_path / "shot.png"
+    Image.new("RGB", (8, 8), "gold").save(image)
+
+    def review(agent, prompt, image_files, *, purpose):
+        raise RuntimeError("vision provider timed out")
+
+    monkeypatch.setattr(shot_image_qa_agent, "invoke_with_images_and_evaluation", review)
+    result = shot_image_qa_agent.review_shot_images({
+        "shot_plan": [{"shot_id": "shot-001", "characters_present": []}],
+        "image_prompt_requests": [{"shot_id": "shot-001"}],
+        "generated_images": [{"shot_id": "shot-001", "generation_status": "success", "image_path": str(image)}],
+    })
+
+    assert result["shot_image_qa_results"][0]["approved"] is None
+    assert "timed out" in result["shot_image_qa_results"][0]["qa_error"]
+    assert result["shot_image_qa_retry_shots"] == []
+    assert result["llm_evaluations"] == []

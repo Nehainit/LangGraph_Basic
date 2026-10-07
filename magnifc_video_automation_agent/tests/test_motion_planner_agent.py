@@ -1,9 +1,13 @@
 import json
 
+import pytest
+
 from video_automation.agents import motion_planner_agent
 
 
-def test_motion_planner_ignores_model_ids_and_preserves_approved_duration(monkeypatch, tmp_path):
+# The person's storyboard approval decides; a QA rejection is advice and must not block motion.
+@pytest.mark.parametrize("qa_approved", [True, False])
+def test_motion_planner_ignores_model_ids_and_preserves_approved_duration(monkeypatch, tmp_path, qa_approved):
     image = tmp_path / "shot-001.png"
     image.write_bytes(b"image")
     valid = {
@@ -51,7 +55,7 @@ def test_motion_planner_ignores_model_ids_and_preserves_approved_duration(monkey
         }],
         "image_files": [str(image)],
         "shot_image_qa_results": [{
-            "shot_id": "shot-001", "approved": True, "animation_ready": True,
+            "shot_id": "shot-001", "approved": qa_approved, "animation_ready": qa_approved,
             "issues": [], "retry_target": None,
         }],
         "narration_segment_timings": [{
@@ -63,3 +67,38 @@ def test_motion_planner_ignores_model_ids_and_preserves_approved_duration(monkey
     assert result["motion_plan_needs_revision"] is False
     assert len(model.messages) == 1
     assert [item["purpose"] for item in result["llm_evaluations"]] == ["plan_shot_motion"]
+
+
+def test_approved_image_is_never_sent_back_to_shot_planning(monkeypatch, tmp_path):
+    image = tmp_path / "shot-002.png"
+    image.write_bytes(b"image")
+
+    class RefusingModel:
+        model = "motion-test"
+
+        def __init__(self):
+            self.messages = []
+
+        def invoke(self, messages):
+            self.messages.append(messages)
+            return type("Response", (), {
+                "content": json.dumps({"needs_revision": True, "revision_reason": "Timothy Turtle is missing from the image."}),
+                "usage_metadata": {"input_tokens": 20, "output_tokens": 10},
+            })()
+
+    model = RefusingModel()
+    monkeypatch.setattr(motion_planner_agent, "load_model", lambda _name: model)
+    result = motion_planner_agent.create_motion_plans({
+        "shot_plan": [{"shot_id": "shot-002", "estimated_duration_seconds": 3}],
+        "image_prompt_requests": [{"shot_id": "shot-002", "image_prompt": "Riley close-up in the forest."}],
+        "image_files": [str(image)],
+        "shot_image_qa_results": [{"shot_id": "shot-002", "approved": False, "issues": [{"description": "Timothy missing"}]}],
+    })
+
+    assert result["motion_plan_needs_revision"] is False
+    assert result["shot_plan_needs_revision"] is False
+    assert result["motion_plans"][0]["camera_motion"]["type"] == "subtle_push_in"
+    assert "gentle default motion" in result["warnings"][-1]
+    # The planner is told the image is approved, and QA advice is no longer part of its input.
+    assert "approved this image" in model.messages[1][1]["content"]
+    assert "image_qa_result" not in model.messages[0][1]["content"]

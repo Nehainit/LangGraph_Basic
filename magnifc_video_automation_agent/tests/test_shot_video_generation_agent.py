@@ -283,3 +283,30 @@ def test_provider_duration_rounds_up_to_cover_the_shot(monkeypatch, tmp_path):
 
     assert durations == [10]
     assert result["generated_videos"][0]["generated_duration_seconds"] == 10
+
+
+def test_fal_video_failure_falls_back_to_magnific(monkeypatch, tmp_path):
+    state = {**_state(tmp_path, count=1), "image_provider": "fal"}
+    monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://media.example.com")
+    monkeypatch.setattr(shot_video_generation_agent, "public_artifact_url", lambda _state, path: f"https://media.example.com/{Path(path).name}")
+    models = []
+
+    def generate(call_state, _scene, _image_file, video_file, _prompt, image_url, *_args):
+        model = call_state.get("video_model") or "fal"
+        models.append(model)
+        if model == "fal":
+            raise RuntimeError("fal unavailable")
+        assert image_url == "https://media.example.com/shot-001.png"
+        video_file.write_bytes(b"video")
+        return str(video_file)
+
+    monkeypatch.setattr(shot_video_generation_agent, "_generate_scene_video_file", generate)
+    monkeypatch.setattr(shot_video_generation_agent, "_clip", lambda *_args: (_ for _ in ()).throw(AssertionError("FFmpeg used")))
+    result = shot_video_generation_agent.create_shot_videos(state)
+    item = result["generated_videos"][0]
+
+    assert models[-1] == "kling-v2-6-pro" and models.count("fal") >= 1
+    assert item["generation_status"] == "success"
+    assert item["provider"] == "fal" and item["provider_used"] == "magnific"
+    assert item["model_used"] == "kling-v2-6-pro"
+    assert "animated on Magnific" in result["warnings"][-1]

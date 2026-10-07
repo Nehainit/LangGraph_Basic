@@ -113,8 +113,8 @@
             <div class="advanced-body">
               <div class="adv-row"><span>Platform</span>
                 <div class="segmented" role="radiogroup" aria-label="Generation platform">
-                  <label><input type="radio" name="image_provider" value="magnific" checked><span>Magnific</span></label>
-                  <label><input type="radio" name="image_provider" value="fal"><span>fal.ai</span></label>
+                  <label><input type="radio" name="image_provider" value="fal" checked><span>fal.ai</span></label>
+                  <label><input type="radio" name="image_provider" value="magnific"><span>Magnific</span></label>
                 </div>
               </div>
               <div class="adv-row"><span>Picture</span>
@@ -165,15 +165,22 @@
               <label for="reviewNote">Your direction <span id="noteHint"></span></label>
               <textarea id="reviewNote" rows="3" placeholder="Describe what should change…"></textarea>
             </div>
+            <div class="rendering" id="renderingBar" hidden>
+              <div class="loader" role="progressbar" aria-label="Your shots are being animated"><span></span></div>
+              <p id="renderingText"></p>
+            </div>
             <p class="field-error" id="reviewError" role="alert" hidden></p>
-            <div class="actions"><div class="actions" id="reviewActions"></div><button class="link-button" type="button" data-action="edit">Back to my story</button></div>
+            <div class="actions" id="reviewFooter"><div class="actions" id="reviewActions"></div><button class="link-button" type="button" data-action="edit">Back to my story</button></div>
           </div>
 
           <div id="resultPane" hidden>
             <div class="result-grid">
               <div class="result-player"><video id="resultVideo" controls playsinline preload="metadata"></video></div>
               <div>
-                <p class="notice" id="resultWarnings" hidden></p>
+                <details class="notice notes" id="resultWarnings" hidden>
+                  <summary id="resultWarningsSummary"></summary>
+                  <ul id="resultWarningsList"></ul>
+                </details>
                 <div class="actions">
                   <a class="primary-button compact" id="downloadLink" download="film.mp4">Download film</a>
                   <button class="secondary-button" type="button" data-action="remix">Make another version</button>
@@ -185,7 +192,10 @@
                 </details>
               </div>
             </div>
-            <div class="shot-strip" id="shotStrip"></div>
+            <section class="clips" id="clipsSection" hidden>
+              <h3 class="block-title">Your clips</h3>
+              <div id="clipCarousel"></div>
+            </section>
           </div>
 
           <div id="failurePane" hidden>

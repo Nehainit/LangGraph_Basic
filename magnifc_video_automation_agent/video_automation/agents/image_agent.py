@@ -55,7 +55,7 @@ from video_automation.prompts import (
     mood_board_prompt,
 )
 from video_automation.schema import AgentState
-from video_automation.model_catalog import selected_model
+from video_automation.model_catalog import LEGACY_PROVIDER_MODELS, selected_model
 from video_automation.agents.story_agent import _parse_json
 
 
@@ -234,8 +234,6 @@ def build_image_prompts(state: AgentState) -> dict:
             f"Emotion: {shot['emotion']}.",
             f"Location: {location.get('description', '')}.",
             f"Visual style: {visual_style}.",
-            f"Continuity entering the shot: {shot.get('continuity_in', '')}.",
-            f"Continuity leaving the shot: {shot.get('continuity_out', '')}.",
         ]
         if character_definitions:
             prompt_parts.append(
@@ -250,6 +248,10 @@ def build_image_prompts(state: AgentState) -> dict:
             visual_style,
             bible,
         )
+        # Continuity notes narrate between shots ("speeds, then naps"), so they sit outside the
+        # still-frame check. Only the incoming state belongs in this frame; continuity_out is the next shot's.
+        if str(shot.get("continuity_in") or "").strip():
+            candidate["image_prompt"] += f" Continuity entering the shot: {shot['continuity_in'].strip()}."
         requests.append({
             "shot_id": shot["shot_id"],
             "scene_id": shot["scene_id"],
@@ -488,6 +490,22 @@ def _generate_fal_reference_image(
     return model
 
 
+def _magnific_fallback_image(
+    fal_error: Exception | str, prompt: str, size: str, image_file: Path,
+    reference_files: list[str], *args: Any, **kwargs: Any,
+) -> str:
+    """fal.ai is the default image provider; Magnific redraws the image when a fal call fails."""
+    limit = int(PIPELINE_CONFIG["images"]["max_reference_images"]["magnific"])
+    if kwargs.get("reference_labels"):
+        kwargs["reference_labels"] = list(kwargs["reference_labels"])[:limit]
+    print(f"[image] fal.ai failed for {Path(image_file).name}; retrying on Magnific: {fal_error}", flush=True)
+    try:
+        _generate_reference_image(prompt, size, image_file, list(reference_files)[:limit], *args, **kwargs)
+    except Exception as exc:
+        raise RuntimeError(f"fal.ai failed ({fal_error}); Magnific fallback failed ({exc})") from exc
+    return LEGACY_PROVIDER_MODELS["magnific"]["image"]
+
+
 def _generate_provider_image(
     state: AgentState, prompt: str, size: str, image_file: Path,
     reference_files: list[str], *args: Any, **kwargs: Any,
@@ -501,12 +519,15 @@ def _generate_unpriced_provider_image(
     reference_files: list[str], *args: Any, **kwargs: Any,
 ) -> None:
     if selected_model(state, "image")["provider"] == "fal.ai":
-        _env("FAL_KEY")
-        prompt = _with_reference_legend(
+        fal_prompt = _with_reference_legend(
             prompt, len(reference_files), kwargs.get("reference_labels"),
             str(args[0] if args else kwargs.get("reference_text", "")),
         )
-        _generate_fal_reference_image(prompt, size, image_file, reference_files, kwargs.get("resolution", "1K"))
+        try:
+            _env("FAL_KEY")
+            _generate_fal_reference_image(fal_prompt, size, image_file, reference_files, kwargs.get("resolution", "1K"))
+        except Exception as exc:
+            _magnific_fallback_image(exc, prompt, size, image_file, reference_files, *args, **kwargs)
     else:
         _generate_reference_image(prompt, size, image_file, reference_files, *args, **kwargs)
 
@@ -1195,6 +1216,20 @@ def _generate_shot_image_job(job: dict) -> dict:
             if is_permanent_error(exc):
                 # Content-policy, invalid-request, and budget failures repeat on every attempt.
                 break
+    provider_used = job["provider"]
+    if error and job["provider"] == "fal" and not budget_exceeded:
+        try:
+            with paid_call(job["ledger"], f"image:{image_file}:magnific", "image", shot_id, job["price"]):
+                model_used = _magnific_fallback_image(
+                    error, job["prompt"], job["aspect_ratio"], image_file, job["reference_files"],
+                    reference_labels=job["reference_labels"], improve_prompt=False, resolution=job["resolution"],
+                )
+            if not image_file.is_file() or image_file.stat().st_size == 0:
+                raise RuntimeError("Magnific returned an empty image asset.")
+            error, provider_used = "", "magnific"
+        except Exception as exc:
+            error = str(exc)
+            budget_exceeded = isinstance(exc, BudgetExceeded)
     success = not error
     print(
         f"{prefix} {'DONE' if success else 'ERROR'} {shot_id} elapsed={time.monotonic() - started:.1f}s",
@@ -1209,6 +1244,7 @@ def _generate_shot_image_job(job: dict) -> dict:
         "location_id": job["location_id"],
         "generation_status": "success" if success else "failed",
         "provider": job["provider"],
+        "provider_used": provider_used,
         "selected_model_id": job.get("selected_model_id", job["model_used"]),
         "model_used": model_used,
         "aspect_ratio": job["aspect_ratio"],
