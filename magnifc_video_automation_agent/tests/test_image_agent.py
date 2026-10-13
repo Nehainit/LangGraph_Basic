@@ -1075,3 +1075,22 @@ def test_sequence_words_in_continuity_notes_do_not_fail_the_image_prompt():
 
     assert "Rabbit is tired after sprinting." in prompt
     assert "then naps" not in prompt
+
+
+def test_still_frame_check_ignores_quoted_dialogue_but_not_staging():
+    shot = {
+        "visual_action": "Draupadi declares: 'Then let your arrow guard dharma, and I will walk beside it.'",
+        "visual_focus": "Draupadi", "framing": "medium", "camera_angle": "eye_level",
+        "composition": "centered", "emotion": "resolute", "characters_present": [],
+    }
+    location = {"description": "moonlit courtyard"}
+    prompt = " ".join([shot["visual_action"], "Draupadi medium eye_level centered resolute moonlit courtyard ink"])
+
+    assert image_agent._validate_image_prompt({"image_prompt": prompt}, shot, location, "ink", {})
+
+    staged = {**shot, "visual_action": "Draupadi turns, then raises her hand."}
+    with pytest.raises(RuntimeError, match="one still frame"):
+        image_agent._validate_image_prompt(
+            {"image_prompt": prompt.replace(shot["visual_action"], staged["visual_action"])},
+            staged, location, "ink", {},
+        )

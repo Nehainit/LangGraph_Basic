@@ -126,10 +126,12 @@ def _validate_image_prompt(value: object, shot: dict, location: dict, visual_sty
     }
     if any(character_id and re.search(rf"\b{re.escape(character_id)}\b", normalized) for character_id in absent_ids):
         raise RuntimeError("Image prompt introduced a character outside characters_present.")
+    # Quoted dialogue ("'Then let your arrow guard dharma...'") is spoken words, not frame staging.
+    staging = re.sub(r"\"[^\"]*\"|“[^”]*”|‘[^’]*’|(?<!\w)'[^']*'(?!\w)", " ", normalized)
     if re.search(
         r"\b(?:then|afterward|subsequently)\b|\bcamera\s+(?:pans|tilts|orbits|tracks|dollies|zooms)\b|"
         r"\banimat(?:e|ed|ing)\b|\banimation\s+of\b",
-        normalized,
+        staging,
     ):
         raise RuntimeError("Image prompt must describe one still frame without sequence, animation, or camera movement.")
     return {"image_prompt": prompt.strip()}
