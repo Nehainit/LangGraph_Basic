@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -32,6 +33,7 @@ from video_automation.cost_control import (
     clear_job,
     file_identity,
     fingerprint,
+    image_model_for_role,
     image_price,
     is_permanent_error,
     ledger_for,
@@ -41,7 +43,9 @@ from video_automation.cost_control import (
     video_price,
     write_job,
 )
-from video_automation.continuity_context import character_definitions, continuity_context, location_definitions
+from video_automation.continuity_context import (
+    character_definitions, continuity_context, library_character_for, location_definitions,
+)
 from video_automation.models import invoke_with_evaluation, load_model
 from video_automation.prompts import (
     IMAGE_PROMPT_BUILDER_CONFIG,
@@ -55,7 +59,7 @@ from video_automation.prompts import (
     mood_board_prompt,
 )
 from video_automation.schema import AgentState
-from video_automation.model_catalog import LEGACY_PROVIDER_MODELS, selected_model
+from video_automation.model_catalog import LEGACY_PROVIDER_MODELS, billed_seconds, selected_model
 from video_automation.agents.story_agent import _parse_json
 
 
@@ -68,7 +72,6 @@ MAGNIFIC_IMAGE_TO_VIDEO_URL = "https://api.magnific.com/v1/ai/image-to-video/kli
 MAGNIFIC_IMAGE_TO_VIDEO_STATUS_URL = "https://api.magnific.com/v1/ai/image-to-video/kling-v2-6"
 FAL_TEXT_TO_IMAGE_MODEL = "fal-ai/nano-banana-pro"
 FAL_EDIT_IMAGE_MODEL = "fal-ai/nano-banana-pro/edit"
-FAL_IMAGE_TO_VIDEO_MODEL = "fal-ai/kling-video/v2.6/pro/image-to-video"
 NANO_ASPECT_RATIOS = {"square_1_1": "1:1", "social_story_9_16": "9:16"}
 DEFAULT_CHARACTER_SHEET_REFERENCE = Path(__file__).resolve().parents[2] / "assets" / "character_sheet_layout_reference.png"
 IMPROVE_PROMPT_LIMIT = 2500
@@ -128,12 +131,24 @@ def _validate_image_prompt(value: object, shot: dict, location: dict, visual_sty
         raise RuntimeError("Image prompt introduced a character outside characters_present.")
     # Quoted dialogue ("'Then let your arrow guard dharma...'") is spoken words, not frame staging.
     staging = re.sub(r"\"[^\"]*\"|“[^”]*”|‘[^’]*’|(?<!\w)'[^']*'(?!\w)", " ", normalized)
-    if re.search(
+    # The approved style must appear in the prompt, and "3D animated feature-film look" names a look, not motion.
+    style = " ".join(str(visual_style).casefold().split())
+    if style:
+        staging = staging.replace(style, " ")
+    staging = re.sub(
+        r"\b(?:2d|3d|cg|cgi|stop[- ]motion)\s+animat(?:ed|ion)\b|"
+        r"\banimated\s+(?:feature|film|movie|style|look|cartoon|series|character|characters)\b",
+        " ", staging,
+    )
+    staged = re.search(
         r"\b(?:then|afterward|subsequently)\b|\bcamera\s+(?:pans|tilts|orbits|tracks|dollies|zooms)\b|"
         r"\banimat(?:e|ed|ing)\b|\banimation\s+of\b",
         staging,
-    ):
-        raise RuntimeError("Image prompt must describe one still frame without sequence, animation, or camera movement.")
+    )
+    if staged:
+        raise RuntimeError(
+            f'Image prompt must describe one still frame without sequence, animation, or camera movement (found "{staged.group(0)}").'
+        )
     return {"image_prompt": prompt.strip()}
 
 
@@ -452,8 +467,10 @@ def _with_reference_legend(prompt: str, reference_count: int, labels: list[str] 
     return f"Attached reference images, in order. {legend} {note}".strip() + f"\n{prompt}"
 
 
-def _fal_image_model(reference_files: list[str]) -> str:
-    return FAL_EDIT_IMAGE_MODEL if reference_files else FAL_TEXT_TO_IMAGE_MODEL
+def _fal_image_model(reference_files: list[str], model_id: str | None = None) -> str:
+    """The fal.ai endpoint for a catalog image model: its /edit variant takes reference images."""
+    base = model_id or FAL_TEXT_TO_IMAGE_MODEL
+    return f"{base}/edit" if reference_files else base
 
 
 def _generate_fal_reference_image(
@@ -462,10 +479,11 @@ def _generate_fal_reference_image(
     image_file: Path,
     reference_files: list[str],
     resolution: str,
+    model_id: str | None = None,
 ) -> str:
     if fal_client is None:
         raise RuntimeError("Install fal-client to use the fal image provider.")
-    model = _fal_image_model(reference_files)
+    model = _fal_image_model(reference_files, model_id)
 
     def arguments() -> dict:
         values = {
@@ -510,15 +528,19 @@ def _magnific_fallback_image(
 
 def _generate_provider_image(
     state: AgentState, prompt: str, size: str, image_file: Path,
-    reference_files: list[str], *args: Any, **kwargs: Any,
+    reference_files: list[str], *args: Any, role: str = "character_sheet", **kwargs: Any,
 ) -> None:
-    with paid_call(ledger_for(state), f"image:{image_file}", "image", Path(image_file).stem, image_price(state)):
-        _generate_unpriced_provider_image(state, prompt, size, image_file, reference_files, *args, **kwargs)
+    model = image_model_for_role(state, role)
+    with paid_call(
+        ledger_for(state), f"image:{image_file}", "image", Path(image_file).stem, image_price(state, model["id"]),
+        role=role, model=model["id"],
+    ):
+        _generate_unpriced_provider_image(state, prompt, size, image_file, reference_files, *args, model_id=model["id"], **kwargs)
 
 
 def _generate_unpriced_provider_image(
     state: AgentState, prompt: str, size: str, image_file: Path,
-    reference_files: list[str], *args: Any, **kwargs: Any,
+    reference_files: list[str], *args: Any, model_id: str | None = None, **kwargs: Any,
 ) -> None:
     if selected_model(state, "image")["provider"] == "fal.ai":
         fal_prompt = _with_reference_legend(
@@ -527,7 +549,10 @@ def _generate_unpriced_provider_image(
         )
         try:
             _env("FAL_KEY")
-            _generate_fal_reference_image(fal_prompt, size, image_file, reference_files, kwargs.get("resolution", "1K"))
+            _generate_fal_reference_image(
+                fal_prompt, size, image_file, reference_files, kwargs.get("resolution", "1K"),
+                model_id or selected_model(state, "image")["id"],
+            )
         except Exception as exc:
             _magnific_fallback_image(exc, prompt, size, image_file, reference_files, *args, **kwargs)
     else:
@@ -638,6 +663,24 @@ def _scene_video_prompt(scene: dict) -> str:
     )
 
 
+def _fal_video_arguments(
+    model: dict, image_url: str, prompt: str, negative_prompt: str, duration: int, cfg_scale: float, generate_audio: bool,
+) -> dict:
+    """Map one image-to-video request onto the fields of the model's fal.ai endpoint."""
+    builder = model.get("arguments")
+    if builder == "kling_pro":
+        return {
+            "start_image_url": image_url, "prompt": prompt, "negative_prompt": negative_prompt,
+            "duration": str(duration), "generate_audio": generate_audio,
+        }
+    if builder == "kling_standard":
+        return {
+            "image_url": image_url, "prompt": prompt, "negative_prompt": negative_prompt,
+            "duration": str(duration), "cfg_scale": cfg_scale,
+        }
+    raise RuntimeError(f"No fal.ai argument builder for video model {model['id']}.")
+
+
 def _generate_scene_video_file(
     state: AgentState,
     scene: dict,
@@ -650,15 +693,17 @@ def _generate_scene_video_file(
     aspect_ratio: str = "social_story_9_16",
     generate_audio: bool = False,
 ) -> str:
-    provider = "fal" if selected_model(state, "video")["provider"] == "fal.ai" else "magnific"
-    duration = min((5, 10), key=lambda value: abs(value - float(scene.get("duration_seconds", 5))))
+    model = selected_model(state, "video")
+    provider = "fal" if model["provider"] == "fal.ai" else "magnific"
+    # Billed at the shortest clip that covers the shot, never rounded down to a clip that is too short.
+    duration = billed_seconds(model, min(float(scene.get("duration_seconds", 5)), max(model.get("durations") or [10])))
     meta_file = video_file.with_suffix(".json")
     meta = {
         "prompt": prompt,
         "image_file": str(Path(image_file).resolve()),
         "duration": duration,
         "provider": provider,
-        "model": selected_model(state, "video")["id"],
+        "model": model["id"],
         "negative_prompt": negative_prompt,
         "cfg_scale": cfg_scale,
         "aspect_ratio": aspect_ratio,
@@ -707,16 +752,12 @@ def _generate_scene_video_file(
                     image_url = fal_client.upload_file(image_file)
                 finally:
                     phase_done("upload")
-                return {
-                    "start_image_url": image_url,
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "duration": str(duration),
-                    "generate_audio": generate_audio,
-                }
+                return _fal_video_arguments(
+                    model, image_url, prompt, negative_prompt, duration, cfg_scale, generate_audio,
+                )
 
             try:
-                response = _fal_job(FAL_IMAGE_TO_VIDEO_MODEL, arguments, job_file, request_fingerprint, FAL_VIDEO_TIMEOUT_SECONDS)
+                response = _fal_job(model["id"], arguments, job_file, request_fingerprint, FAL_VIDEO_TIMEOUT_SECONDS)
             finally:
                 phase_done("provider_wait")
             try:
@@ -728,7 +769,11 @@ def _generate_scene_video_file(
             return url
 
         # Only the provider request is refundable; a finished job is billed even if its download fails.
-        with paid_call(ledger_for(state), f"video:{video_file}", "video", video_file.stem, video_price(state, duration)):
+        with paid_call(
+            ledger_for(state), f"video:{video_file}", "video", video_file.stem, video_price(state, duration, model),
+            shot_id=scene.get("shot_id"), model=model["id"], billed_seconds=duration,
+            requested_seconds=round(float(scene.get("requested_duration_seconds") or scene.get("duration_seconds") or duration), 3),
+        ):
             video_url = request_video()
         try:
             _save_generated_video(video_url, video_file)
@@ -818,11 +863,14 @@ def create_character_sheets(state: AgentState) -> dict[str, list[str]]:
 
 
 def _run_image_jobs(state: AgentState, jobs: list[tuple]) -> None:
-    """Generate independent reference images concurrently; each job is (prompt, size, file, references, args)."""
+    """Generate independent reference images concurrently; each job is (prompt, size, file, references, args[, role])."""
     if not jobs:
         return
     with ThreadPoolExecutor(max_workers=_image_worker_count(len(jobs)), thread_name_prefix="reference-image") as pool:
-        list(pool.map(lambda job: _generate_provider_image(state, *job[:4], *job[4]), jobs))
+        list(pool.map(
+            lambda job: _generate_provider_image(state, *job[:4], *job[4], role=job[5] if len(job) > 5 else "character_sheet"),
+            jobs,
+        ))
 
 
 def _location_plate_prompt(location: dict, visual_style: str, feedback: str) -> str:
@@ -850,16 +898,22 @@ def _location_plate_jobs(state: AgentState, out: Path, regenerate: bool, feedbac
             continue
         plate = _next_version(out, f"location_{_slug(location_id)}")
         files[location_id] = str(plate)
-        jobs.append((_location_plate_prompt(location, visual_style, feedback), aspect_ratio, plate, [], ()))
+        jobs.append((_location_plate_prompt(location, visual_style, feedback), aspect_ratio, plate, [], (), "location_plate"))
     return files, jobs
 
 
 def _character_sheet_jobs(state: AgentState, out: Path, feedback: str) -> tuple[list[Path], list[tuple]]:
     layout_files = _character_sheet_reference_files()
+    definitions = character_definitions(state)
     files, jobs = [], []
     for index, character in enumerate(_character_specs(state), start=1):
         character_file = _next_version(out, f"character_{index:03}_{_slug(character)}")
         files.append(character_file)
+        saved = library_character_for(definitions[index - 1]["name"], state) if index <= len(definitions) else None
+        if saved and Path(saved["sheet_file"]).is_file():
+            # The user's approved library sheet is reused as-is, so the film matches it and nothing is paid to redraw it.
+            shutil.copyfile(saved["sheet_file"], character_file)
+            continue
         jobs.append((
             character_sheet_prompt(
                 [character],
@@ -920,9 +974,10 @@ def create_reference_package(state: AgentState) -> dict:
         or (state.get("image_model") and state.get("reference_model_id") != selected_model(state, "image")["id"])
     )
     location_files, location_jobs = _location_plate_jobs(state, locations_out, regenerate, feedback)
+    use_mood_board = bool(PIPELINE_CONFIG["images"].get("mood_board", False))
     if regenerate:
         character_board = _next_version(characters_out, "characters_reference")
-        mood_board = _next_version(mood_out, "mood_board")
+        mood_board = _next_version(mood_out, "mood_board") if use_mood_board else None
         future = None if feedback else _prefetched_sheets.pop(_sheet_key(state), None)
         character_files = None
         if future:
@@ -937,29 +992,30 @@ def create_reference_package(state: AgentState) -> dict:
             # Sheets and location plates are independent, so they render together; the mood board needs the sheets.
             _run_image_jobs(state, [*character_jobs, *location_jobs])
         _combine_character_sheets(character_files, character_board)
-        _generate_provider_image(
-            state,
-            mood_board_prompt(
-                story=state["story"],
-                tone=state["tone"],
-                characters=state["characters"],
-                production_bible=continuity_context(state),
+        if mood_board:
+            _generate_provider_image(
+                state,
+                mood_board_prompt(
+                    story=state["story"],
+                    tone=state["tone"],
+                    characters=state["characters"],
+                    production_bible=continuity_context(state),
+                )
+                + (f" Human feedback: {feedback}" if feedback else ""),
+                "square_1_1",
+                mood_board,
+                [str(path) for path in character_files[:3]],
             )
-            + (f" Human feedback: {feedback}" if feedback else ""),
-            "square_1_1",
-            mood_board,
-            [str(path) for path in character_files[:3]],
-        )
     else:
         character_board = Path(state["character_board_file"])
-        mood_board = Path(state["mood_board_file"])
+        mood_board = Path(state["mood_board_file"]) if state.get("mood_board_file") else None
         character_files = [Path(path) for path in state["character_reference_files"]]
         _run_image_jobs(state, location_jobs)
 
     return {
         "character_board_file": str(character_board),
         "character_reference_files": [str(path) for path in character_files],
-        "mood_board_file": str(mood_board),
+        "mood_board_file": str(mood_board) if mood_board else "",
         "location_reference_files": location_files,
         "cost_ledger": ledger_for(state).snapshot(),
         "reference_provider": selected_model(state, "image")["provider"],
@@ -1191,12 +1247,15 @@ def _generate_shot_image_job(job: dict) -> dict:
     budget_exceeded = False
     for attempt in range(1, job["max_attempts"] + 1):
         try:
-            with paid_call(job["ledger"], f"image:{image_file}", "image", shot_id, job["price"]):
+            with paid_call(
+                job["ledger"], f"image:{image_file}", "image", shot_id, job["price"],
+                role="shot_frame", model=job["role_model_id"],
+            ):
                 if job["provider"] == "fal":
                     model_used = _generate_fal_reference_image(
                         _with_reference_legend(job["prompt"], len(job["reference_files"]), job["reference_labels"]),
                         job["aspect_ratio"], image_file,
-                        job["reference_files"], job["resolution"],
+                        job["reference_files"], job["resolution"], job["role_model_id"],
                     )
                 else:
                     _generate_reference_image(
@@ -1266,6 +1325,8 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
     if not shots or [item.get("shot_id") for item in requests] != [shot.get("shot_id") for shot in shots]:
         raise RuntimeError("Shot Image Generation Agent needs exactly one ordered request per approved shot.")
     selected_id = selected_model(state, "image")["id"]
+    # Shot frames may use a cheaper model than the character sheets (images.role_models in config/pipeline.yml).
+    frame_model_id = image_model_for_role(state, "shot_frame")["id"]
     provider = "fal" if selected_model(state, "image")["provider"] == "fal.ai" else "magnific"
     if provider == "fal":
         _env("FAL_KEY")
@@ -1343,7 +1404,7 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
         return reference_ids, reference_files, location_file, previous_file, character_reference_count
 
     def model_for(image_provider: str, reference_files: list[str]) -> str:
-        return _fal_image_model(reference_files) if image_provider == "fal" else str(config["model_used"])
+        return _fal_image_model(reference_files, frame_model_id) if image_provider == "fal" else str(config["model_used"])
 
     def provenance_for(metadata: dict, reference_files: list[str]) -> tuple[str, str]:
         stored_provider = metadata.get("provider")
@@ -1352,14 +1413,14 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
             return str(stored_provider), str(stored_model)
         if stored_model == config["model_used"]:
             return "magnific", str(stored_model)
-        if stored_model in {FAL_TEXT_TO_IMAGE_MODEL, FAL_EDIT_IMAGE_MODEL}:
+        if str(stored_model).startswith("fal-ai/"):
             return "fal", str(stored_model)
         if stored_provider in {"magnific", "fal"}:
             return str(stored_provider), model_for(str(stored_provider), reference_files)
         return provider, model_for(provider, reference_files)
 
     ledger = ledger_for(state)
-    price = image_price(state)
+    price = image_price(state, frame_model_id)
     redo_counts = {shot_id: dict(counts) for shot_id, counts in (state.get("paid_redo_counts") or {}).items()}
     automatic_redos = set(state.get("shot_image_qa_retry_shots", []))
     requested_redos = {str(item.get("shot_id")) for item in state.get("visual_feedback", [])}
@@ -1470,7 +1531,7 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
                         "location_id": prompt_request.get("location_id"), "aspect_ratio": aspect_ratio,
                         "resolution": resolution, "max_attempts": max_attempts,
                         "provider": provider, "model_used": model_for(provider, reference_files), "selected_model_id": selected_id,
-                        "ledger": ledger, "price": price,
+                        "ledger": ledger, "price": price, "role_model_id": frame_model_id,
                     })
 
                 for metadata in pool.map(_generate_shot_image_job, jobs):
@@ -1521,8 +1582,8 @@ def create_visual_storyboard(state: AgentState) -> dict:
     storyboard = state.get("storyboard")
     if not storyboard:
         raise RuntimeError("Visual storyboard agent needs storyboard scenes.")
-    if not state.get("character_reference_files") or not state.get("mood_board_file"):
-        raise RuntimeError("Visual storyboard needs an approved character and mood board package.")
+    if not state.get("character_reference_files"):
+        raise RuntimeError("Visual storyboard needs an approved character package.")
 
     out = _out_dir(state, "images")
     out.mkdir(parents=True, exist_ok=True)
@@ -1597,9 +1658,10 @@ def create_visual_storyboard(state: AgentState) -> dict:
                 image_file,
                 [
                     *character_references,
-                    state["mood_board_file"],
+                    *([state["mood_board_file"]] if state.get("mood_board_file") else []),
                 ],
-                reference_labels=[*reference_labels, "the approved mood board"],
+                reference_labels=[*reference_labels, *(["the approved mood board"] if state.get("mood_board_file") else [])],
+                role="shot_frame",
             )
         image_files.append(str(image_file))
 

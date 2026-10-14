@@ -93,3 +93,38 @@ if __name__ == "__main__":
         test_create_subtitles(Path(tmp))
         test_word_level_subtitles(Path(tmp))
     test_requires_storyboard()
+
+
+def _timed_alignment(spans):
+    chars, starts, ends = [], [], []
+    for text, start, end in spans:
+        if chars:
+            chars.append(" "); starts.append(starts[-1]); ends.append(ends[-1])
+        step = (end - start) / len(text)
+        for index, char in enumerate(text):
+            chars.append(char); starts.append(start + index * step); ends.append(start + (index + 1) * step)
+    return {"characters": chars, "character_start_times_seconds": starts, "character_end_times_seconds": ends}
+
+
+def test_hindi_captions_end_with_their_sentence_and_leave_no_stray_word(tmp_path):
+    import json
+    from video_automation.agents.subtitle_agent import _word_subtitles
+
+    words = [
+        ("सब", 0.0, 0.3), ("सन्न", 0.35, 0.7), ("थे।", 0.75, 1.0),
+        ("केला", 1.1, 1.4), ("भाई", 1.45, 1.7), ("ने", 1.75, 1.85), ("मैंगो", 1.9, 2.2), ("रानी", 2.25, 2.5), ("से", 2.55, 2.65), ("फुसफुसाया।", 2.7, 3.3),
+        ("क्या", 5.0, 5.2), ("तुम", 5.25, 5.4), ("मुझे", 5.45, 5.7), ("मिस", 5.75, 5.95), ("कर", 6.0, 6.1), ("रहे", 6.15, 6.3), ("थे?", 6.35, 6.6),
+    ]
+    alignment_file = tmp_path / "alignment.json"
+    alignment_file.write_text(json.dumps({"alignment": _timed_alignment(words)}, ensure_ascii=False), encoding="utf-8")
+
+    captions = [item["text"] for item in _word_subtitles(str(alignment_file))]
+
+    assert captions == [
+        "सब सन्न थे।",
+        # Seven words is over the six-word limit, so the sentence splits evenly instead of leaving one word over.
+        "केला भाई ने मैंगो",
+        "रानी से फुसफुसाया।",
+        "क्या तुम मुझे मिस",
+        "कर रहे थे?",
+    ]

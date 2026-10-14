@@ -195,7 +195,39 @@ def _clip(
     )
 
 
-def _video_clip(video_file: str, duration: float, clip_file: Path, source_in: float = 0.0, width: int = 1080, height: int = 1920) -> None:
+def punch_in_allowed(shot: dict | None, duration: float, provider: str | None = None) -> bool:
+    """A long wide or medium AI clip can cut to a closer crop of itself; close-ups would crop faces."""
+    grammar = PIPELINE_CONFIG["shot_grammar"]
+    framing = str((shot or {}).get("framing", "")).casefold()
+    return bool(
+        grammar.get("punch_in_cuts") and provider != "ffmpeg"
+        and duration >= float(grammar["punch_in_min_seconds"])
+        and ("wide" in framing or "medium" in framing) and "close" not in framing
+    )
+
+
+def punch_in_filters(source: str, output: str, width: int, height: int, duration: float, tag: str) -> list[str]:
+    """Filter steps that cut halfway through a clip to a centred crop of the same clip: a free second angle."""
+    half = duration / 2
+    zoom = float(PIPELINE_CONFIG["shot_grammar"]["punch_in_zoom"])
+    return [
+        f"{source}split[{tag}a][{tag}b]",
+        f"[{tag}a]trim=end={half:.6f},setpts=PTS-STARTPTS,setsar=1[{tag}w]",
+        f"[{tag}b]trim=start={half:.6f},setpts=PTS-STARTPTS,crop=iw/{zoom}:ih/{zoom},scale={width}:{height},setsar=1[{tag}c]",
+        f"[{tag}w][{tag}c]concat=n=2:v=1:a=0{output}",
+    ]
+
+
+def _video_clip(
+    video_file: str, duration: float, clip_file: Path, source_in: float = 0.0, width: int = 1080, height: int = 1920,
+    punch_in: bool = False,
+) -> None:
+    base = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps=30"
+    if punch_in:
+        graph = ";".join([f"[0:v]{base}[base]", *punch_in_filters("[base]", "[cut]", width, height, duration, "p"), "[cut]format=yuv420p[v]"])
+        video_args = ["-filter_complex", graph, "-map", "[v]"]
+    else:
+        video_args = ["-vf", f"{base},format=yuv420p"]
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -206,8 +238,7 @@ def _video_clip(video_file: str, duration: float, clip_file: Path, source_in: fl
             video_file,
             "-t",
             str(duration),
-            "-vf",
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps=30,format=yuv420p",
+            *video_args,
             "-an",
             "-r",
             "30",
@@ -291,9 +322,16 @@ def _audio_mix_command(state: AgentState, timings: list[dict], total_seconds: fl
             f"volume={sound['ambience_volume']}[amb{index}]"
         )
         bed.append(f"[amb{index}]")
+    for cue in state.get("sound_cues") or []:
+        # Timed effects from the sound library land on story moments; the bed ducks them under narration.
+        start_ms = int(float(cue["start_seconds"]) * 1000)
+        index = add_input(cue["file"])
+        filters.append(f"[{index}:a]aresample=44100,adelay={start_ms}|{start_ms},volume={float(cue.get('volume', 0.6))}[cue{index}]")
+        bed.append(f"[cue{index}]")
     if state.get("music_file"):
-        index = add_input(state["music_file"])
-        filters.append(f"[{index}:a]volume={sound['music_volume']}[music]")
+        # Library music may be shorter than the film, so it loops and is cut at the film's end.
+        index = add_input(state["music_file"], loop=True)
+        filters.append(f"[{index}:a]aresample=44100,atrim=0:{total_seconds:.3f},asetpts=PTS-STARTPTS,volume={sound['music_volume']}[music]")
         bed.append("[music]")
 
     narration = f"[0:a]volume={sound['narration_volume']}"
@@ -339,6 +377,7 @@ def edit_video(state: AgentState) -> dict[str, str]:
     durations = []
     scene_video_files = state.get("scene_video_files") or []
     timeline = state.get("edit_timeline") or []
+    providers = {item.get("shot_id"): item.get("provider") for item in state.get("generated_videos") or []}
     if approved_rough_cut and approved_rough_cut.is_file():
         picture_track = approved_rough_cut
     else:
@@ -359,7 +398,10 @@ def edit_video(state: AgentState) -> dict[str, str]:
             clip_file = clips_out / f"{scene.get('shot_id', f'shot-{index + 1:03}')}.mp4"
             if index < len(scene_video_files) and scene_video_files[index]:
                 source_in = float(timeline[index].get("source_in", 0)) if index < len(timeline) else 0.0
-                _video_clip(scene_video_files[index], render_duration, clip_file, source_in, width, height)
+                _video_clip(
+                    scene_video_files[index], render_duration, clip_file, source_in, width, height,
+                    punch_in=punch_in_allowed(scene, render_duration, providers.get(scene.get("shot_id"))),
+                )
             else:
                 _clip(image_file, render_duration, str(scene.get("motion", "static")), clip_file, width, height)
             clips.append(clip_file)

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
@@ -20,10 +20,14 @@ sys.path.insert(0, str(ROOT))
 from video_automation.agent_graph import build_story_graph, persistent_checkpointer
 from video_automation.models import validate_model_configuration
 from video_automation.model_catalog import DEFAULT_MODELS, LEGACY_PROVIDER_MODELS, MODELS, model_entry
-from video_automation.prompts import PIPELINE_CONFIG
+from video_automation.prompts import PIPELINE_CONFIG, VISUAL_STYLES
 from video_automation.agents.story_agent import UnsafeContentError
+from video_automation.agents.story_writer_agent import write_story
 from video_automation.agents.video_validator import validate_generated_videos
 from video_automation.artifact_store import archive_artifacts
+from video_automation.cost_control import spend_summary
+from video_automation.auth import public_auth_config, require_user
+from video_automation.character_library import film_characters, router as character_router, saved_character_names
 
 
 class VideoRequest(BaseModel):
@@ -34,7 +38,9 @@ class VideoRequest(BaseModel):
     aspect_ratio: Literal["16:9", "9:16", "1:1"] = "9:16"
     video_quality: Literal["standard", "high"] = "standard"
     image_provider: Literal["magnific", "fal"] = "fal"
-    visual_style: Literal["cinematic", "illustrated", "3d_animation", "anime"] | None = None
+    visual_style: Literal["realistic", "cinematic", "illustrated", "3d_animation", "anime"] | None = None
+    # Library characters the user @-mentioned in the topic.
+    character_ids: list[str] = Field(default_factory=list, max_length=6)
     narration_model: str | None = None
     image_model: str | None = None
     video_model: str | None = None
@@ -45,6 +51,17 @@ class VideoRequest(BaseModel):
         if value is not None:
             model_entry(info.field_name.removesuffix("_model"), value)
         return value
+
+
+class StoryChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class StoryWriterRequest(BaseModel):
+    messages: list[StoryChatMessage] = Field(min_length=1, max_length=30)
+    duration: int = Field(default=30, ge=5, le=120)
+    language: str = Field(default="English", max_length=40)
 
 
 class StoryReviewRequest(BaseModel):
@@ -90,12 +107,14 @@ class DirectorReviewRequest(BaseModel):
 
 
 class VisualStoryboardReviewRequest(DirectorReviewRequest):
-    pass
+    # Per-shot video tier chosen on the storyboard, e.g. {"shot-003": "standard"} to animate a still shot.
+    video_tiers: dict[str, Literal["static", "standard", "premium"]] = Field(default_factory=dict)
 
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=FRONTEND), name="frontend")
 app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
+app.include_router(character_router)
 logger = logging.getLogger(__name__)
 graph = build_story_graph(
     checkpointer=persistent_checkpointer(ROOT / ".langgraph-checkpoints.sqlite"),
@@ -200,6 +219,10 @@ def _artifacts(result: dict) -> dict:
                 "image_url": _output_url(item.get("source_image_file")),
                 "status": item.get("generation_status"),
                 "provider": item.get("provider"),
+                "model": item.get("model_used"),
+                "video_tier": item.get("video_tier"),
+                # planned_static: still motion chosen to save cost; generation_failed: fallback after an error.
+                "reason": item.get("reason"),
             }
             for item in result.get("generated_videos", [])
         ],
@@ -249,6 +272,12 @@ def _artifacts(result: dict) -> dict:
             sum(float(entry["usd"]) for entry in result.get("cost_ledger", []))
             + sum(float(item.get("cost_usd") or 0) for item in result.get("llm_evaluations", [])),
             4,
+        ),
+        # Spend per category plus billed video seconds the edit threw away (the number cost work must shrink).
+        "spend": spend_summary(
+            result.get("cost_ledger", []),
+            sum(float(item.get("cost_usd") or 0) for item in result.get("llm_evaluations", [])),
+            result.get("edit_timeline", []),
         ),
         "budget_usd": PIPELINE_CONFIG["budget"]["max_usd_per_video"],
         "budget_exhausted": result.get("budget_exhausted", False),
@@ -321,8 +350,8 @@ def _graph_response(result: dict, thread_id: str) -> dict:
                     "production_bible": review["production_bible"],
                     "character_board_file": review["character_board_file"],
                     "character_board_url": _output_url(review["character_board_file"]),
-                    "mood_board_file": review["mood_board_file"],
-                    "mood_board_url": _output_url(review["mood_board_file"]),
+                    "mood_board_file": review.get("mood_board_file"),
+                    "mood_board_url": _output_url(review.get("mood_board_file")),
                 }
             )
             artifacts["storage"] = _archive({**result, **artifacts}, thread_id, "reference-board-review")
@@ -460,6 +489,10 @@ def _resume_review(thread_id: str, node: str, command: dict) -> dict:
             and snapshot.values.get({"review_story": "approved", "review_visual_storyboard": "visual_approved"}.get(node, ""))
         ):
             value = None
+        elif snapshot.next and any(getattr(task, "error", None) for task in getattr(snapshot, "tasks", ())):
+            # The run crashed after this review (e.g. a provider or validation error); retrying resumes the failed step.
+            logger.info("Retrying failed step %s for %s", list(snapshot.next), thread_id)
+            value = None
         else:
             raise HTTPException(status_code=404, detail="Review session not found or already completed.")
         return _graph_response(_auto_advance(graph.invoke(value, config), thread_id), thread_id)
@@ -494,15 +527,23 @@ def index() -> FileResponse:
     return FileResponse(FRONTEND / "index.html")
 
 
-VISUAL_STYLES = {
-    "cinematic": "Cinematic live-action look with natural light and a shallow depth of field",
-    "illustrated": "Hand-illustrated storybook look with soft painterly textures",
-    "3d_animation": "Polished 3D animated feature-film look",
-    "anime": "Japanese anime look with clean line art and vivid cel shading",
-}
+@app.get("/characters")
+def characters_page() -> FileResponse:
+    return FileResponse(FRONTEND / "characters.html")
 
 
-@app.get("/api/model-catalog")
+@app.get("/sign-in")
+@app.get("/sign-up")
+def auth_page() -> FileResponse:
+    return FileResponse(FRONTEND / "auth.html")
+
+
+@app.get("/api/auth-config")
+def auth_config() -> dict:
+    return public_auth_config()
+
+
+@app.get("/api/model-catalog", dependencies=[Depends(require_user)])
 def model_catalog() -> dict:
     return {"models": MODELS, "pricing_note": "Indicative public API rates; actual charges depend on provider billing."}
 
@@ -517,9 +558,14 @@ def resolve_request_models(request: VideoRequest) -> dict[str, str]:
 
 
 @app.post("/api/create-video")
-def create_video(request: VideoRequest) -> dict:
+def create_video(request: VideoRequest, user_id: str | None = Depends(require_user)) -> dict:
     if not request.topic.strip():
         raise HTTPException(status_code=400, detail="Topic is required.")
+    cast = film_characters(user_id, request.character_ids)
+    topic = request.topic.strip()
+    for character in cast:
+        # "@Meera" is how the studio marks a saved character; the story model just needs the name.
+        topic = topic.replace(f"@{character['name']}", character["name"])
     try:
         validate_model_configuration("shot-image-qa")
     except RuntimeError as exc:
@@ -529,11 +575,12 @@ def create_video(request: VideoRequest) -> dict:
         result = graph.invoke(
             {
                 "thread_id": thread_id,
-                "topic": request.topic.strip(),
+                "topic": topic,
                 "tone": "Infer the tone and visual style from the user's prompt.",
                 "duration": f"{request.duration} seconds",
                 "language": request.language.strip() or "English",
-                "characters": [],
+                "characters": [f"{character['name']}: {character['description']}" for character in cast],
+                "library_characters": cast,
                 "output_dir": str(ROOT / "outputs" / thread_id),
                 "quality_mode": request.quality_mode,
                 "aspect_ratio": request.aspect_ratio,
@@ -556,7 +603,31 @@ def create_video(request: VideoRequest) -> dict:
         raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
 
 
-@app.post("/api/review-story")
+@app.post("/api/story-writer")
+def story_writer(request: StoryWriterRequest, user_id: str | None = Depends(require_user)) -> dict:
+    if request.messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="The last message must be yours.")
+    try:
+        result = write_story(
+            [message.model_dump() for message in request.messages],
+            seconds=request.duration, language=request.language.strip() or "English",
+            saved_names=saved_character_names(user_id),
+        )
+    except UnsafeContentError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc), "categories": exc.categories}) from exc
+    except Exception as exc:
+        logger.exception("Story writer failed")
+        raise HTTPException(status_code=502, detail={"error": f"The story writer is unavailable right now: {exc}"}) from exc
+    return {
+        "title": result["title"],
+        "story": result["story"],
+        "reply": result["reply"],
+        "characters": result["characters"],
+        "cost_usd": round(sum(float(item.get("cost_usd") or 0) for item in result["llm_evaluations"]), 6),
+    }
+
+
+@app.post("/api/review-story", dependencies=[Depends(require_user)])
 def submit_story_review(request: StoryReviewRequest) -> dict:
     thread_id = request.thread_id.strip()
     command = {"action": request.action}
@@ -572,7 +643,7 @@ def submit_story_review(request: StoryReviewRequest) -> dict:
     return _resume_review(thread_id, "review_story", command)
 
 
-@app.post("/api/review-reference-board")
+@app.post("/api/review-reference-board", dependencies=[Depends(require_user)])
 def submit_reference_review(request: ReferenceReviewRequest) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
@@ -583,25 +654,25 @@ def submit_reference_review(request: ReferenceReviewRequest) -> dict:
     return _resume_review(request.thread_id.strip(), "review_reference_package", command)
 
 
-@app.post("/api/review-scene-plan")
+@app.post("/api/review-scene-plan", dependencies=[Depends(require_user)])
 def submit_scene_plan_review(request: ScenePlanReviewRequest) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
     return _resume_review(request.thread_id.strip(), "review_scene_plan", command)
 
 
-@app.post("/api/review-visual-plan")
+@app.post("/api/review-visual-plan", dependencies=[Depends(require_user)])
 def submit_visual_plan_review(request: VisualPlanReviewRequest) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
     return _resume_review(request.thread_id.strip(), "review_visual_plan", command)
 
 
-@app.post("/api/review-shot-plan")
+@app.post("/api/review-shot-plan", dependencies=[Depends(require_user)])
 def submit_shot_plan_review(request: ShotPlanReviewRequest) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
     return _resume_review(request.thread_id.strip(), "review_shot_plan", command)
 
 
-@app.post("/api/review-director-plan")
+@app.post("/api/review-director-plan", dependencies=[Depends(require_user)])
 def submit_director_review(request: DirectorReviewRequest) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
@@ -609,15 +680,17 @@ def submit_director_review(request: DirectorReviewRequest) -> dict:
     return _resume_review(request.thread_id.strip(), "review_director_plan", command)
 
 
-@app.post("/api/review-visual-storyboard")
+@app.post("/api/review-visual-storyboard", dependencies=[Depends(require_user)])
 def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
         command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_visual_storyboard", request.feedback)
+    elif request.video_tiers:
+        command["video_tiers"] = request.video_tiers
     return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command)
 
 
-@app.get("/output/{path:path}")
+@app.get("/output/{path:path}", dependencies=[Depends(require_user)])
 def output_file(path: str) -> FileResponse:
     file_path = (ROOT / path).resolve()
     try:

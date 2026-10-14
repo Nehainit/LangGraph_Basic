@@ -15,8 +15,15 @@ pipeline:
     reject_duplicate_actions: true
     # Consecutive shots in one scene with the same framing and angle get the next framing (wide/medium/close-up).
     vary_repeated_framing: true
-    # Kling renders 5 or 10 second clips, so scenes are paced at about one visible moment per 5 seconds.
-    target_shot_seconds: 5
+    # Shots are paced from the video model's shortest billed clip (Kling: 5 s), so each paid clip is mostly used.
+    # A scene gets ceil((seconds - slack) / clip) shots, and no shot is shorter than this ratio of the clip.
+    min_shot_seconds_ratio: 0.7
+    # A shot may run this far past the clip length; the edit timeline accepts that small shortfall.
+    shot_overrun_slack_seconds: 0.15
+    # Cut halfway through a long wide/medium shot to a centred 1.25x crop of the same clip (a free second angle).
+    punch_in_cuts: true
+    punch_in_min_seconds: 4.0
+    punch_in_zoom: 1.25
 
   images:
     workers: 4
@@ -30,11 +37,66 @@ pipeline:
     max_reference_images:
       magnific: 3
       fal: 6
+    # The mood board costs one image per film; its palette and lighting already reach every shot as text.
+    mood_board: false
+    # Cheaper model per image role when the film's image model is on this provider. Character sheets keep the
+    # selected model because they anchor identity for the whole film. Remove a role to use the selected model.
+    role_models:
+      fal.ai:
+        location_plate: fal-ai/nano-banana-2
+        shot_frame: fal-ai/nano-banana-2
+
+  narration:
+    # Storytelling delivery. Lower stability widens emotional range; style adds performance (Multilingual v2 only).
+    # The reference Shorts speak 2.5-3.2 words/second; 0.95 measured 2.36, so 1.05 moves toward them while line
+    # breaks and ellipses still leave pauses. The narration word range scales with this value.
+    voice_settings:
+      stability: 0.4
+      similarity_boost: 0.75
+      style: 0.35
+      use_speaker_boost: true
+      speed: 1.05
+    # A blank line between story beats gives the voice a breath between moments.
+    segment_separator: "\n\n"
+    # reels: the structure of the narration Shorts that perform (The Harish Fact, 34M views, analyzed 2026-10-13):
+    # cold open (the climax moment, narrated) -> [question hook] -> story -> closing line -> [call to action].
+    # plain: one segment per story beat. Films shorter than formula_min_seconds always use plain.
+    formula: reels
+    formula_min_seconds: 20
+    # Default for the "call to action" ending ("comment ...", "like"); the studio form can turn it off per film.
+    call_to_action: false
+    # A question hook after the cold open ("Did you know...?"). The cold open already hooks the viewer.
+    hook_question: false
+    # Off by default (2026-10-14: one narrator suits these films better than per-character voices without lip sync).
+    # When on and the approved story contains quoted dialogue, the soundtrack is only those lines, each spoken by its
+    # character in a voice matching their gender. Stage directions stay visual guidance and are never narrated.
+    # Stories without dialogue use the narrator formula above.
+    dialogue_only: false
+    # ElevenLabs premade voices, assigned in order of first appearance so two characters never share a voice.
+    character_voices:
+      female: [cgSgspJ2msm6clMCkdW9, EXAVITQu4vr4xnSDxMaL, pFZP5JQG7iQjIQuC4Bof, XrExE9yKIg1WjnnlVkGX]
+      # Checked 2026-10-14: Liam (TX3LPaxmHKxFdv7VawmU) is not available to this account.
+      male: [IKne3meq5aSn9XLyUdCD, JBFqnCBsd6RMkjVDRZzb, nPczCjzI2devNBz1zQrb]
+    # Silence between two lines of one beat, and between beats (where the picture carries the action).
+    dialogue_gap_seconds: 0.4
+    beat_gap_seconds: 0.8
+    # Short dialogue is padded toward the requested length: beat gaps grow up to this, the rest holds at the end.
+    max_beat_gap_seconds: 2.5
+    max_ending_hold_seconds: 3.0
 
   sound:
     enabled: true
-    ambience: true
+    # Background sound (wind, crowd, night insects): one ElevenLabs clip per location, looped across its scenes.
+    # Off by default: it needs the API key's sound_generation permission and costs $0.12 per location.
+    ambience: false
     music: true
+    # Tried in order; the first that succeeds scores the film. fal is about $0.01 per 30 s film,
+    # ElevenLabs about $0.08 and needs the key's music_generation permission.
+    # library: free CC0 music and timed sound effects from Freesound (config/sound_library.yml), $0 per film.
+    # fal and elevenlabs generate music for a fee; they are no longer used.
+    music_providers: [library]
+    sound_effects: true
+    fal_music_model: cassetteai/music-generator
     narration_volume: 1.0
     ambience_volume: 0.35
     music_volume: 0.22
@@ -54,8 +116,21 @@ pipeline:
     max_paid_redos_per_shot:
       image: 1
       video: 1
-    # Providers that bill in credits rather than USD. Set these to include those calls in the budget;
-    # null counts them as $0.
-    magnific_usd_per_credit: null
-    elevenlabs_sound_usd_per_call: null
-    elevenlabs_music_usd_per_minute: null
+    # Providers that bill in credits rather than USD, so every paid call counts toward the cap.
+    # Magnific: Premium plan, $14.50/month for 20,000 credits (confirm against your API invoice).
+    magnific_usd_per_credit: 0.000725
+    # ElevenLabs API, checked 2026-10-11: sound effects are billed per generation, music per minute.
+    elevenlabs_sound_usd_per_call: 0.12
+    elevenlabs_music_usd_per_minute: 0.15
+    # fal.ai CassetteAI music generator, checked 2026-10-12: billed per output minute.
+    fal_music_usd_per_minute: 0.02
+
+  video_tiers:
+    # static: free FFmpeg camera motion. standard: the cheaper model below. premium: the film's selected model.
+    standard_model:
+      fal.ai: fal-ai/kling-video/v2.5-turbo/standard/image-to-video
+    # Plan policy: a plan without premium video gets standard for every animated shot.
+    allow_premium: true
+    allow_static: true
+    # At most one static shot per this many shots; never the first shot and never two in a row.
+    shots_per_static: 4

@@ -30,6 +30,7 @@ AGENT_MODEL_ENV = {
     "orchestrator": "ORCHESTRATOR_MODEL",
     "safety": "SAFETY_MODEL",
     "story": "STORY_MODEL",
+    "story-writer": "STORY_WRITER_MODEL",
     "narration": "NARRATION_MODEL",
     "director": "DIRECTOR_MODEL",
     "storyboard": "STORYBOARD_MODEL",

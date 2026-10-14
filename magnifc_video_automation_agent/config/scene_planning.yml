@@ -64,10 +64,22 @@ scene_planning:
 
     Visible Action Pacing
 
-    visible_action_pacing gives a suggested number of visible actions for each narration segment.
-    Give each scene about that many distinct visible moments so every shot can hold the screen for about
-    5 seconds. Reach the number with different views of the approved events (an establishing view of the
-    place, the action itself, a reaction, an important detail), never by inventing new plot events.
+    visible_action_pacing gives max_visible_actions for each narration segment. It is a hard maximum,
+    not a target: every visible action becomes a paid video shot of about 5 seconds, and extra actions
+    are cut. Across all scenes made from one segment, plan at most that many visible actions in total.
+    List each scene's single most important action first. Prefer one scene per segment unless the
+    segment truly moves to a new location. Never invent new plot events to fill time.
+
+    Narration Roles
+
+    Every narration segment has a role. story segments follow the rules above. The others still get scenes:
+    cold_open: a dramatic line said before the story starts; it comes from the beat in its parent_beat_ids.
+    Show that climax moment, using the same location description and characters as the scene you plan for
+    that beat, so the film can return to it later.
+    hook: a question to the viewer. Show the story's central characters at the heart of the question, with no
+    new event, in a location the story already uses.
+    closing: the lesson and the call to action. Show a calm closing image of the resolution from its parent beat.
+    Plan exactly one visible action for each cold_open, hook, and closing scene.
 
     Scene Boundary Principle
 

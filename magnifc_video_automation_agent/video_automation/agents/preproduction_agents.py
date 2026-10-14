@@ -1,13 +1,16 @@
 import hashlib
 import json
 import logging
+import math
 import re
 from copy import deepcopy
 
 from video_automation.continuity_context import continuity_context
+from video_automation.model_catalog import min_billed_seconds
 from video_automation.agents.director_agent import _narration_words
 from video_automation.models import invoke_with_evaluation, load_model
 from video_automation.prompts import (
+    DIALOGUE_SYSTEM_PROMPT,
     NARRATION_REVIEW_SYSTEM_PROMPT,
     NARRATION_SYSTEM_PROMPT,
     PIPELINE_CONFIG,
@@ -167,6 +170,14 @@ def _cast(context: dict) -> dict[str, str]:
     return result
 
 
+def _named_characters(text: str, cast: dict[str, str]) -> list[str]:
+    """Approved character IDs whose ID or name appears as a whole word in the text."""
+    return list(dict.fromkeys(
+        character_id for alias, character_id in cast.items()
+        if re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE)
+    ))
+
+
 def _context(state: AgentState) -> dict:
     return continuity_context(state)
 
@@ -228,6 +239,353 @@ def _is_hindi_text(text: str) -> bool:
     return devanagari > 0 and devanagari >= latin
 
 
+# A heard sentence longer than this is hard to follow in a short film; the narration writer is asked to split it.
+MAX_SPOKEN_SENTENCE_WORDS = 16
+
+
+def _long_spoken_sentences(texts: list[str]) -> list[str]:
+    """Spoken sentences over the length a listener can follow on the first hearing."""
+    sentences = [
+        part.strip() for text in texts
+        for part in re.split(r'(?<=[.!?\u2026])["\u201d]?\s+|\n+', text) if part.strip()
+    ]
+    return [sentence for sentence in sentences if len(_narration_words(sentence)) > MAX_SPOKEN_SENTENCE_WORDS]
+
+
+ENGLISH_STYLE_EXAMPLE = (
+    "Why would a turtle race a rabbit?\nEveryone laughed when he said yes.\n"
+    "The rabbit bragged that he would wait at the finish line.\nHe was so sure, he took a nap...\n"
+    "The turtle never stopped.\nAnd that was enough."
+)
+# Natural spoken Hindi: one narrator in third person, what characters say is retold, never quoted.
+HINDI_STYLE_EXAMPLE = (
+    "एक कछुआ... खरगोश से रेस लगाएगा?\nसब हँस पड़े।\nखरगोश ने शेखी मारी कि वो आखिरी लाइन पर इंतज़ार करेगा।\n"
+    "इतना भरोसा... कि वह रास्ते में ही सो गया।\nकछुआ रुका नहीं।\nऔर बस यही काफ़ी था।"
+)
+# The reels formula on a different story, so the model copies the shape and never the words.
+ENGLISH_REELS_EXAMPLE = {
+    "cold_open": {"text": "Suddenly, the whole forest was cheering... for the turtle.", "source_beat_number": 3},
+    "hook": "So how did the slowest animal in the forest beat the fastest?",
+    "narration_segments": [
+        {"text": "Once, a rabbit laughed at a turtle for being slow.\nThe turtle calmly asked him for a race."},
+        {"text": "The rabbit ran so far ahead, he stopped for a nap...\nThe turtle never stopped."},
+        {"text": "The rabbit woke up to cheering.\nThe turtle had already crossed the line."},
+    ],
+    "moral": "Pride falls asleep. Effort keeps walking.",
+    "call_to_action": "If you believe in steady effort, comment slow and steady and like the video.",
+}
+HINDI_REELS_EXAMPLE = {
+    "cold_open": {"text": "अचानक पूरा जंगल तालियाँ बजाने लगा... कछुए के लिए।", "source_beat_number": 3},
+    "hook": "जंगल का सबसे धीमा जानवर... सबसे तेज़ को कैसे हरा गया?",
+    "narration_segments": [
+        {"text": "एक बार खरगोश ने कछुए की धीमी चाल का मज़ाक उड़ाया।\nकछुए ने शांति से उसे रेस के लिए कहा।"},
+        {"text": "खरगोश इतना आगे निकल गया... कि रास्ते में ही सो गया।\nकछुआ रुका नहीं।"},
+        {"text": "खरगोश की आँख खुली, तो तालियाँ बज रही थीं।\nकछुआ लाइन पार कर चुका था।"},
+    ],
+    "moral": "घमंड सो जाता है... मेहनत चलती रहती है।",
+    "call_to_action": "अगर आप भी मेहनत पर भरोसा करते हैं, तो कमेंट में लिखिए धीरे चलो पर चलते रहो, और वीडियो को लाइक करें।",
+}
+
+QUOTED_TEXT = re.compile(r"\"[^\"]*\"|“[^”]*”")
+# A tag after the quote ('"...," उसने कहा।' / '"...," she said.') instead of a lead-in naming the speaker first.
+TRAILING_DIALOGUE_TAG = re.compile(
+    r"[\"”]\s*[,.।!?]?\s*(?:[^\s\"“”]+\s+){0,2}?(?:ने\s+)?(?:कहा|पूछा|बोला|बोली|बोले|said|asked|replied|whispered|shouted)"
+    r"(?:\s+\w+){0,2}\s*(?:[.।!]|$)",
+    re.MULTILINE | re.IGNORECASE,
+)
+DEVANAGARI = "ऀ-ॿ"
+FIRST_PERSON = {
+    True: re.compile(rf"(?<![{DEVANAGARI}])(?:मैं|मैंने|मुझे|मेरा|मेरी|मेरे|हम|हमने|हमें|हमारा|हमारी|हमारे)(?![{DEVANAGARI}])"),
+    False: re.compile(r"\b(?:I|we|We|me|my|My|our|Our|us)\b"),
+}
+
+
+def _narration_formula(seconds: float) -> str:
+    config = PIPELINE_CONFIG.get("narration") or {}
+    if str(config.get("formula", "plain")) == "reels" and seconds >= float(config.get("formula_min_seconds", 20)):
+        return "reels"
+    return "plain"
+
+
+def _call_to_action(state: AgentState) -> bool:
+    value = state.get("call_to_action")
+    if value is None:
+        value = (PIPELINE_CONFIG.get("narration") or {}).get("call_to_action", True)
+    return bool(value)
+
+
+def _hook_question() -> bool:
+    return bool((PIPELINE_CONFIG.get("narration") or {}).get("hook_question", False))
+
+
+def _narration_schema(formula: str, call_to_action: bool) -> dict:
+    if formula == "plain":
+        return NARRATION_OUTPUT_SCHEMA
+    schema = deepcopy(NARRATION_OUTPUT_SCHEMA)
+    text = {"type": "string"}
+    schema["properties"].update({
+        "cold_open": {
+            "type": "object", "additionalProperties": False, "required": ["text", "source_beat_number"],
+            "properties": {"text": text, "source_beat_number": {"type": "integer", "minimum": 1}},
+        },
+        "moral": text,
+    })
+    schema["required"] = ["cold_open", *schema["required"], "moral"]
+    if _hook_question():
+        schema["properties"]["hook"] = text
+        schema["required"].insert(1, "hook")
+    if call_to_action:
+        schema["properties"]["call_to_action"] = text
+        schema["required"].append("call_to_action")
+    return schema
+
+
+def _reels_instructions(beat_count: int, call_to_action: bool, hindi: bool, total_words: int) -> str:
+    caps = {
+        "cold_open": max(6, round(total_words * 0.12)),
+        "hook": max(6, round(total_words * 0.14)),
+        "moral": max(4, round(total_words * 0.08)),
+        "call_to_action": max(6, round(total_words * 0.12)),
+    }
+    example = dict(HINDI_REELS_EXAMPLE if hindi else ENGLISH_REELS_EXAMPLE)
+    hook = _hook_question()
+    if not call_to_action:
+        example.pop("call_to_action")
+    if not hook:
+        example.pop("hook")
+    hook_part = (
+        "2. hook: one or two short questions on the story's paradox or stakes, so the viewer must stay for the answer\n"
+        "   (\"Did you know...?\"; in Hindi \"क्या आप जानते हैं...?\"). Never reveal the answer.\n" if hook else ""
+    )
+    cta_part = (
+        "5. call_to_action: one short line asking the viewer to comment a phrase from the story's world "
+        "(a devotional story suits \"comment जय श्री कृष्णा\") and like the video.\n" if call_to_action else ""
+    )
+    return f"""Write the voice-over in the reels formula. The parts play in this order:
+1. cold_open: the most dramatic moment of the climax, narrated in one short line ("Suddenly, ..." / "अचानक ...").
+   source_beat_number is the 1-based approved beat it comes from. 3 to 14 words. The story later reaches this
+   moment again.
+{hook_part}3. narration_segments: exactly {beat_count}, one per approved story beat, in the same order. The first starts the
+   story ("Once," / "एक बार" / "दरअसल एक बार"). Retell what the characters say in reported speech.
+4. moral: one short closing line. If the story resolves, the lesson or payoff in a few words; if it ends unresolved,
+   a suspense line that leaves the viewer waiting for the next part, revealing nothing.
+{cta_part}Word budget for {total_words} words in total: cold_open at most {caps["cold_open"]},{f' hook at most {caps["hook"]},' if hook else ''}
+moral at most {caps["moral"]}{f', call_to_action at most {caps["call_to_action"]}' if call_to_action else ''}, and the rest for the story segments.
+Keep each story segment's dialogue complete; never cut a line off mid-sentence to save words.
+Example of the formula (a different story; copy the shape and style, never the words):
+{json.dumps(example, ensure_ascii=False, indent=1)}"""
+
+
+def _spoken_style_issues(segments: list[dict], hindi: bool, story_has_dialogue: bool) -> list[str]:
+    """Free checks for the habits the reference Shorts never show; each becomes retry feedback."""
+    issues = []
+    for segment in segments:
+        text, role = segment["text"], segment.get("role", "story")
+        if TRAILING_DIALOGUE_TAG.search(text):
+            issues.append(
+                f'{segment["segment_id"]} tags a line after the quote; name the speaker before it '
+                '(Arjun said, "..." / अर्जुन बोला, "...").'
+            )
+        if hindi:
+            latin = sorted(set(re.findall(r"[A-Za-z]{2,}", text)))
+            if latin:
+                issues.append(f'{segment["segment_id"]} has Latin letters ({", ".join(latin[:4])}); write every word in Devanagari.')
+        if role in {"story", "cold_open"} and FIRST_PERSON[hindi].search(QUOTED_TEXT.sub(" ", text)):
+            issues.append(f'{segment["segment_id"]} narrates in first person; the narrator says he, she, or they outside quotes.')
+        if re.search(r"[\"“”]", text):
+            issues.append(
+                f'{segment["segment_id"]} quotes dialogue; one narrator retells it in reported speech, without quotation marks.'
+            )
+        unfinished = [line.strip() for line in text.splitlines() if line.strip() and not re.search(r"[.!?।…]$", line.strip())]
+        if unfinished:
+            # A spoken line without a full stop runs into the next one; the voice needs the pause.
+            issues.append(f'{segment["segment_id"]} has lines without ending punctuation (। . ? !): "{unfinished[0]}".')
+        if role == "hook" and "?" not in text:
+            issues.append("hook must ask the viewer a question.")
+    return issues
+
+
+def _reels_segments(data: dict, beat_ids: list[str], call_to_action: bool) -> list[tuple[str, list[str], object]]:
+    """Order the reels parts as they play; each item is (role, parent beat IDs, raw text)."""
+    cold_open = data.get("cold_open")
+    if not isinstance(cold_open, dict):
+        raise RuntimeError("cold_open must be an object with text and source_beat_number.")
+    number = cold_open.get("source_beat_number")
+    if type(number) is not int or not 1 <= number <= len(beat_ids):
+        raise RuntimeError(f"cold_open source_beat_number must be a beat number from 1 to {len(beat_ids)}.")
+    closing = [data.get("moral")]
+    if call_to_action:
+        closing.append(data.get("call_to_action"))
+    hook = _hook_question()
+    if any(not isinstance(item, str) or not item.strip() for item in [*([data.get("hook")] if hook else []), *closing]):
+        raise RuntimeError(("hook, " if hook else "") + "moral" + (", and call_to_action" if call_to_action else "") + " need spoken text.")
+    segments = data["narration_segments"]
+    if len(segments) != len(beat_ids):
+        raise RuntimeError(
+            f"Narration needs exactly one segment per approved story beat; expected {len(beat_ids)}, received {len(segments)}."
+        )
+    return [
+        ("cold_open", [beat_ids[number - 1]], cold_open.get("text")),
+        # The hook may restate any beat, so it traces to all of them.
+        *([("hook", list(beat_ids), data["hook"])] if hook else []),
+        *[
+            ("story", [beat_id], segment.get("text") if isinstance(segment, dict) else None)
+            for segment, beat_id in zip(segments, beat_ids)
+        ],
+        ("closing", [beat_ids[-1]], "\n".join(item.strip() for item in closing)),
+    ]
+
+
+QUOTED_LINE = re.compile(r'"([^"]+)"|“([^”]+)”')
+DIALOGUE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["lines"],
+    "properties": {
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["beat_number", "speaker", "gender", "text"],
+                "properties": {
+                    "beat_number": {"type": "integer", "minimum": 1},
+                    "speaker": {"type": "string"},
+                    "gender": {"type": "string", "enum": ["female", "male"]},
+                    "text": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
+def _story_dialogue(story: dict) -> list[dict]:
+    """Quoted lines in the approved beats, in order, with the beat they belong to."""
+    lines = []
+    for number, beat in enumerate(story.get("structure", []), start=1):
+        description = str(beat.get("description", ""))
+        for match in QUOTED_LINE.finditer(description):
+            line = (match.group(1) or match.group(2)).strip()
+            if line:
+                lines.append({"beat_number": number, "line": line, "context": description})
+    return lines
+
+
+def _dialogue_problems(data: object, expected: list[dict], cast: dict[str, str], hindi: bool) -> list[str]:
+    if not isinstance(data, dict) or not isinstance(data.get("lines"), list):
+        return ["Return JSON with a lines list."]
+    lines = data["lines"]
+    if len(lines) != len(expected):
+        return [f"Return exactly {len(expected)} lines, one per quoted line, in order; received {len(lines)}."]
+    problems, genders = [], {}
+    for index, (line, source) in enumerate(zip(lines, expected), start=1):
+        if not isinstance(line, dict):
+            problems.append(f"Line {index} must be an object.")
+            continue
+        speaker = str(line.get("speaker", "")).strip()
+        if not speaker or (cast and speaker.casefold() not in cast):
+            names = sorted({name for name in cast if not re.fullmatch(r"character-\d+", name)})
+            problems.append(f'Line {index} speaker "{speaker}" must be one of: {", ".join(names)}.')
+        gender = line.get("gender")
+        if gender not in {"female", "male"}:
+            problems.append(f"Line {index} gender must be female or male.")
+        elif genders.setdefault(cast.get(speaker.casefold(), speaker), gender) != gender:
+            problems.append(f"{speaker} must keep one gender on every line.")
+        text = str(line.get("text", "")).strip().strip("\"“”")
+        if not text:
+            problems.append(f"Line {index} needs spoken text.")
+        elif hindi and (not _is_hindi_text(text) or re.search(r"[A-Za-z]{2,}", text)):
+            problems.append(f"Line {index} must be spoken Hindi in Devanagari, names included.")
+    return problems
+
+
+def _dialogue_narration(state: AgentState, story: dict, language: str, hindi: bool) -> dict | None:
+    """Speak only the story's quoted lines, each by its character; None when the story has no dialogue."""
+    expected = _story_dialogue(story)
+    if not expected:
+        return None
+    beat_ids = [beat["beat_id"] for beat in story["structure"]]
+    cast = _cast(_context(state))
+    names = {alias: character_id for alias, character_id in cast.items()}
+    prompt = json.dumps({
+        "language": language,
+        "approved_characters": _context(state)["characters"],
+        "quoted_lines": expected,
+        "instruction": (
+            f"Return one entry per quoted line, in order, translated into {language}. "
+            + ("Write natural spoken Hindi in Devanagari, names included. " if hindi else "")
+            + "Never add narration or describe actions."
+        ),
+    }, ensure_ascii=False)
+    model = load_model("narration")
+    evaluations = list(state.get("llm_evaluations", []))
+    error, best = "", None
+    for _ in range(3):
+        if hasattr(model, "format"):
+            model.format = DIALOGUE_OUTPUT_SCHEMA
+        response, evaluation = invoke_with_evaluation(
+            model,
+            [
+                {"role": "system", "content": DIALOGUE_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{prompt}\nPrevious error: {error}" if error else prompt},
+            ],
+            agent_name="narration",
+            purpose="generate_dialogue_script",
+        )
+        evaluation["call_number"] = len(evaluations) + 1
+        evaluations.append(evaluation)
+        try:
+            data = _parse_json(response.content) if isinstance(response.content, str) else None
+        except (RuntimeError, ValueError, TypeError):
+            data = None
+        problems = _dialogue_problems(data, expected, cast, hindi)
+        if not problems or (best is None and isinstance(data, dict) and len(data.get("lines") or []) == len(expected)):
+            best = (data, problems)
+        if not problems:
+            break
+        error = " ".join(problems)
+    if best is None:
+        logger.warning("Dialogue script failed; using the narrator formula instead: %s", error)
+        return None
+    data, problems = best
+    segments = []
+    for index, (line, source) in enumerate(zip(data["lines"], expected), start=1):
+        speaker = str(line.get("speaker", "")).strip()
+        text = str(line.get("text", "")).strip().strip("\"“”").strip() or source["line"]
+        segments.append({
+            "segment_id": f"segment-{index:03}",
+            "role": "dialogue",
+            "parent_beat_ids": [beat_ids[source["beat_number"] - 1]],
+            "text": text,
+            "speaker_id": names.get(speaker.casefold(), speaker),
+            "speaker_name": speaker,
+            "voice_gender": line.get("gender") if line.get("gender") in {"female", "male"} else "female",
+        })
+    # A beat without dialogue is pure picture: it plays in the pause of the line before it (or after, at the start).
+    spoken_beats = {beat_id for segment in segments for beat_id in segment["parent_beat_ids"]}
+    for position, beat_id in enumerate(beat_ids):
+        if beat_id in spoken_beats:
+            continue
+        before = [segment for segment in segments if beat_ids.index(segment["parent_beat_ids"][0]) < position]
+        target = before[-1] if before else segments[0]
+        target["parent_beat_ids"] = sorted({*target["parent_beat_ids"], beat_id}, key=beat_ids.index)
+    narration = " ".join(segment["text"] for segment in segments)
+    result = {
+        "narration_script": narration,
+        "narration_segments": segments,
+        "estimated_narration_seconds": round(len(_narration_words(narration)) / 1.5, 1),
+        "needs_story_revision": False,
+        "story_revision_reason": None,
+        "narration_feedback": "",
+        "director_feedback": [],
+        "llm_evaluations": evaluations,
+    }
+    if problems:
+        result["warnings"] = [*state.get("warnings", []), f"Dialogue script warning: {' '.join(problems)}"]
+    return result
+
+
 def create_narration_script(state: AgentState) -> dict:
     requirements = state.get("parsed_requirements") or {}
     story = state.get("story_outline") or {
@@ -237,40 +595,72 @@ def create_narration_script(state: AgentState) -> dict:
     seconds = requirements.get("duration_seconds") or _duration_seconds(state["duration"])
     language = state.get("language") or requirements.get("language") or "English"
     hindi = str(language).strip().casefold() in {"hindi", "hi"}
-    # Measured TTS speech runs about 2.5 words/second; aim a little under so the film fills the requested length.
-    minimum, maximum = max(8, round(seconds * 2.0)), max(8, round(seconds * 2.4))
+    formula = _narration_formula(float(seconds))
+    call_to_action = _call_to_action(state)
+    if (PIPELINE_CONFIG.get("narration") or {}).get("dialogue_only"):
+        dialogue = _dialogue_narration(state, story, language, hindi)
+        if dialogue:
+            return dialogue
+    beat_ids = [beat["beat_id"] for beat in story["structure"]]
+    story_has_dialogue = any(
+        re.search(r"[\"“”]", str(text))
+        for text in [story.get("idea", ""), *(beat.get("description", "") for beat in story["structure"])]
+    )
+    # Expressive delivery with pauses measured 2.36 words/second (Multilingual v2, speed 0.95); the range scales
+    # with the configured voice speed so the script fills the requested length without running over.
+    speed = float(((PIPELINE_CONFIG.get("narration") or {}).get("voice_settings") or {}).get("speed", 0.95))
+    pace = speed / 0.95
+    minimum, maximum = max(8, round(seconds * 2.0 * pace)), max(8, round(seconds * 2.35 * pace))
     target_words = int(state.get("narration_target_words") or 0)
     length_instruction = (
-        f"Use at most {target_words} words total across all segments; measured TTS timing requires this shorter limit."
-        if target_words else f"Suggested narration length: {minimum}-{maximum} words; TTS will determine exact timing."
+        f"Use at most {target_words} words total across all parts; measured TTS timing requires this shorter limit."
+        if target_words else f"Suggested narration length: {minimum}-{maximum} words in total; TTS will determine exact timing."
     )
     feedback = state.get("narration_feedback", "") or " ".join(
         str(item.get("note", "")) for item in state.get("director_feedback", [])
     )
+    if formula == "reels":
+        structure = _reels_instructions(len(beat_ids), call_to_action, hindi, target_words or maximum)
+        schema_text = json.dumps({
+            "cold_open": {"text": "One narrated line about the climax.", "source_beat_number": len(beat_ids)},
+            **({"hook": "A question for the viewer?"} if _hook_question() else {}),
+            "narration_segments": [{"text": "Short spoken lines for the corresponding approved story beat."}],
+            "moral": "One short line.",
+            **({"call_to_action": "One short line."} if call_to_action else {}),
+            "needs_story_revision": False,
+            "revision_reason": None,
+        }, indent=2)
+    else:
+        structure = (
+            "Return exactly one narration segment per approved story beat, in the same order.\n"
+            "Example of the voice-over style (a different story; copy the style, never the words). Note that the speaker\n"
+            "is named before each quote and nothing describes what the picture already shows:\n"
+            + json.dumps(HINDI_STYLE_EXAMPLE if hindi else ENGLISH_STYLE_EXAMPLE, ensure_ascii=False)
+        )
+        schema_text = json.dumps({
+            "narration_segments": [{"text": "Short spoken lines for the corresponding approved story beat, one sentence per line."}],
+            "needs_story_revision": False,
+            "revision_reason": None,
+        }, indent=2)
     prompt = f"""Return JSON using exactly this schema:
-{{
-  "narration_segments": [
-    {{"text": "Natural spoken narration for the corresponding approved story beat."}}
-  ],
-  "needs_story_revision": false,
-  "revision_reason": null
-}}
+{schema_text}
 When needs_story_revision is true, return an empty narration_segments list and a specific revision_reason.
-Otherwise return exactly one narration segment per approved story beat, in the same order.
+{structure}
 Target duration: approximately {seconds} seconds.
 {length_instruction}
 Language: {language}
-{"Write every narration segment in Hindi in Devanagari script. Translate English story beats into Hindi; keep their meaning and event order." if hindi else "Write every narration segment in the requested language."}
+{"Write every part in Hindi in Devanagari script. Translate English story beats and dialogue into Hindi; keep their meaning and event order." if hindi else "Write every part in the requested language."}
 Approved story: {json.dumps(story, ensure_ascii=False)}
 Fixed user requirements: {json.dumps(requirements, ensure_ascii=False)}
-Revision requirement: {feedback or 'none'}"""
+Revision requirement: {feedback or 'none'}
+"""
     model = load_model("narration")
     error = ""
     best = None
     evaluations = list(state.get("llm_evaluations", []))
     for _ in range(3):
         if hasattr(model, "format"):
-            model.format = NARRATION_OUTPUT_SCHEMA
+            model.format = _narration_schema(formula, call_to_action)
         response, evaluation = invoke_with_evaluation(
             model,
             [
@@ -310,35 +700,67 @@ Revision requirement: {feedback or 'none'}"""
                 }
             if reason not in (None, "") or not isinstance(segments, list) or not segments:
                 raise RuntimeError("Approved narration needs segments and no revision reason.")
-            beat_ids = [beat["beat_id"] for beat in story["structure"]]
-            if len(segments) != len(beat_ids):
-                raise RuntimeError(
-                    f"Narration needs exactly one segment per approved story beat; expected {len(beat_ids)}, received {len(segments)}."
-                )
+            if formula == "reels":
+                parts = _reels_segments(data, beat_ids, call_to_action)
+            else:
+                if len(segments) != len(beat_ids):
+                    raise RuntimeError(
+                        f"Narration needs exactly one segment per approved story beat; expected {len(beat_ids)}, received {len(segments)}."
+                    )
+                parts = [
+                    ("story", [beat_id], segment.get("text") if isinstance(segment, dict) else None)
+                    for segment, beat_id in zip(segments, beat_ids)
+                ]
             normalized = []
             texts = []
-            for index, (segment, beat_id) in enumerate(zip(segments, beat_ids), start=1):
-                if not isinstance(segment, dict):
-                    raise RuntimeError("Each narration segment must be an object containing text.")
-                text = segment.get("text")
+            for index, (role, parents, text) in enumerate(parts, start=1):
                 if not isinstance(text, str) or not text.strip():
                     raise RuntimeError("Every narration segment needs spoken text.")
-                text = text.strip()
+                # A line ending in a comma sounds unfinished when spoken.
+                text = re.sub(r",[ \t]*(?=\n|$)", ".", text.strip())
                 if hindi and not _is_hindi_text(text):
                     raise RuntimeError("Narration must be Hindi in Devanagari script in every segment.")
                 texts.append(text)
                 normalized.append({
                     "segment_id": f"segment-{index:03}",
-                    "parent_beat_ids": [beat_id],
+                    "role": role,
+                    "parent_beat_ids": parents,
                     "text": text,
                 })
             segments = normalized
             narration = " ".join(texts)
             words = len(_narration_words(narration))
-            if not target_words or best is None or words < len(_narration_words(best[0])):
-                best = (narration, segments, round(words / 1.5, 1))
+            # Every problem goes back in one retry; reporting only the first left the others unfixed.
+            problems = []
             if target_words and words > target_words:
-                raise RuntimeError(f"Narration has {words} words; use at most {target_words} words to fit measured speech timing.")
+                problems.append(f"Narration has {words} words; use at most {target_words} words to fit measured speech timing.")
+            if not target_words and words > maximum:
+                # A long script runs past the film and costs another paid voice-over to shorten after timing.
+                problems.append(
+                    f"Narration has {words} words; use {minimum}-{maximum} words. Cut repeated images and filler, "
+                    "keep every line of dialogue."
+                )
+            if not target_words and words < minimum:
+                # A short script leaves the film short; fill it with structure, never with filler.
+                problems.append(
+                    f"Narration has {words} words; use {minimum}-{maximum} words. Tell more of the story through its "
+                    "dialogue. Do not add filler or repeat anything."
+                )
+            long_lines = _long_spoken_sentences(texts)
+            if long_lines:
+                problems.append(
+                    "These sentences are too long to follow when heard: "
+                    + " | ".join(f'"{line}"' for line in long_lines[:3])
+                    + f". Split every sentence into short lines of at most {MAX_SPOKEN_SENTENCE_WORDS} words."
+                )
+            problems.extend(_spoken_style_issues(segments, hindi, story_has_dialogue))
+            # The fallback keeps the draft with the fewest problems, then the one closest to the word budget.
+            limit = target_words or maximum
+            rank = (len(problems), max(0, words - limit) + max(0, (0 if target_words else minimum) - words))
+            if best is None or rank < best[3]:
+                best = (narration, segments, round(words / 1.5, 1), rank)
+            if problems:
+                raise RuntimeError(" ".join(problems))
             issues = (
                 _review_narration_traceability(model, story, segments, evaluations)
                 if PIPELINE_CONFIG["planning"]["narration_semantic_review"] else []
@@ -364,7 +786,7 @@ Revision requirement: {feedback or 'none'}"""
         except (RuntimeError, ValueError, TypeError) as exc:
             error = str(exc)
     if best:
-        narration, segments, estimated = best
+        narration, segments, estimated, _ = best
         logger.warning("Narration review advisory; continuing with current narration: %s", error)
         return {
             "narration_script": narration,
@@ -383,7 +805,7 @@ Revision requirement: {feedback or 'none'}"""
     ]
     if fallback_texts and all(fallback_texts) and (not hindi or all(_is_hindi_text(text) for text in fallback_texts)):
         segments = [
-            {"segment_id": f"segment-{index:03}", "parent_beat_ids": [beat["beat_id"]], "text": text}
+            {"segment_id": f"segment-{index:03}", "role": "story", "parent_beat_ids": [beat["beat_id"]], "text": text}
             for index, (beat, text) in enumerate(zip(story["structure"], fallback_texts), start=1)
         ]
         narration = " ".join(fallback_texts)
@@ -581,6 +1003,10 @@ def _validate_scene_plan(data: object, state: AgentState) -> tuple[list[dict], l
         actions = scene["visible_actions"]
         if not isinstance(actions, list) or not actions or any(not isinstance(item, str) or not item.strip() for item in actions):
             raise RuntimeError("Every scene needs at least one visible action.")
+        # A character named in the scene's own actions is on screen, so later shots may draw them.
+        characters.extend(
+            character_id for character_id in _named_characters(" ".join(actions), cast) if character_id not in characters
+        )
         if not config["visible_actions"]["allow_camera_directions"] and any(
             term in action.casefold() for action in actions for term in forbidden_camera_terms
         ):
@@ -616,16 +1042,41 @@ def _validate_scene_plan(data: object, state: AgentState) -> tuple[list[dict], l
     return normalized, analysis
 
 
+def _shots_for_seconds(seconds: float, state: AgentState) -> int:
+    """Shot count for a stretch of narration: each shot fits one shortest billed clip and is never too short."""
+    grammar = PIPELINE_CONFIG["shot_grammar"]
+    clip = float(min_billed_seconds(state))
+    min_shot = clip * float(grammar["min_shot_seconds_ratio"])
+    slack = float(grammar["shot_overrun_slack_seconds"])
+    count = math.ceil(max(0.0, seconds - slack) / clip)
+    return max(1, min(count, int(seconds // min_shot)))
+
+
 def _visible_action_pacing(state: AgentState) -> list[dict]:
-    target = float(PIPELINE_CONFIG["shot_grammar"]["target_shot_seconds"])
     return [
         {
             "segment_id": timing["segment_id"],
-            "suggested_visible_actions": max(1, round((float(timing["end_seconds"]) - float(timing["start_seconds"])) / target)),
+            "max_visible_actions": _shots_for_seconds(float(timing["end_seconds"]) - float(timing["start_seconds"]), state),
         }
         for timing in state.get("narration_segment_timings", [])
         if isinstance(timing, dict) and timing.get("segment_id")
     ]
+
+
+def _film_shot_budget(state: AgentState) -> int:
+    """The most shots the film's narration can fill without paying for clip seconds the edit throws away."""
+    return sum(item["max_visible_actions"] for item in _visible_action_pacing(state)) or 1
+
+
+def _check_shot_budget(scenes: list[dict], state: AgentState) -> None:
+    """Reject a scene plan with more visible moments than the film can use; every action becomes a paid shot."""
+    budget = _film_shot_budget(state)
+    planned = sum(max(1, len(scene["visible_actions"])) for scene in scenes)
+    if planned > budget + 1:
+        raise RuntimeError(
+            f"Plan at most {budget} visible actions across the film (you planned {planned}). "
+            "Keep each scene's single most important action and list it first; merge scenes that share a location."
+        )
 
 
 def plan_scenes(state: AgentState) -> dict:
@@ -690,6 +1141,8 @@ def plan_scenes(state: AgentState) -> dict:
                     "llm_evaluations": evaluations,
                 }
             best = (scenes, analysis)
+            # The plan is kept as the fallback; visual beats are trimmed to the budget either way.
+            _check_shot_budget(scenes, state)
             if config["story_faithfulness"]["semantic_review_enabled"]:
                 if hasattr(model, "format"):
                     model.format = "json"
@@ -892,9 +1345,16 @@ def _validate_visual_plan(data: object, state: AgentState) -> list[dict]:
     if config["coverage"]["require_all_required_scene_actions_represented"]:
         for scene in scenes:
             required_actions = scene.get("visible_actions") or []
-            if traced_scenes.count(scene["scene_id"]) < len(required_actions):
+            # Every beat is a paid shot, so a short scene folds extra actions into fewer beats.
+            shot_budget = _shots_for_seconds(float(scene.get("end_sec", 0)) - float(scene.get("start_sec", 0)), state)
+            if traced_scenes.count(scene["scene_id"]) < min(len(required_actions), shot_budget):
                 raise RuntimeError(
                     f'{scene["scene_id"]} needs at least one focused visual beat for each required visible action.'
+                )
+            if traced_scenes.count(scene["scene_id"]) > shot_budget + 1:
+                raise RuntimeError(
+                    f'{scene["scene_id"]} has {traced_scenes.count(scene["scene_id"])} visual beats; plan at most '
+                    f"{shot_budget}, because every beat becomes a paid video shot."
                 )
     if not config["coverage"]["allow_uncovered_narration_segments"] and set(traced_segments) != set(segment_ids):
         raise RuntimeError("Visual plan must cover every narration segment.")
@@ -916,17 +1376,20 @@ COVERAGE_VIEWS = (
 def _derived_visual_plan(state: AgentState) -> dict:
     """Build visual beats from approved scene actions, without a model call.
 
-    Scenes are paced at about one beat per target_shot_seconds by adding reaction and detail
-    views of the same approved action, so no new story content is invented.
+    Each scene gets the shot count its narration can fill (one shortest billed clip per shot), so no paid
+    clip seconds are trimmed away. Long scenes add reaction and detail views of the same approved action;
+    scenes with more actions than shots fold the extra actions into the last beat, so nothing is invented.
     """
-    target = float(PIPELINE_CONFIG["shot_grammar"]["target_shot_seconds"])
     groups = []
     for scene in state.get("scenes") or []:
         actions = [str(action).strip() for action in scene.get("visible_actions") or [] if str(action).strip()]
         if not actions:
             raise RuntimeError(f'{scene["scene_id"]} has no visible actions to derive visual beats from.')
         seconds = float(scene.get("end_sec", 0)) - float(scene.get("start_sec", 0))
-        moments = min(len(actions) * len(COVERAGE_VIEWS), max(len(actions), round(seconds / target)))
+        moments = min(len(actions) * len(COVERAGE_VIEWS), _shots_for_seconds(seconds, state))
+        if len(actions) > moments:
+            # The scene planner lists the key action first; the rest share the final beat's frame.
+            actions = [*actions[:moments - 1], "; ".join(action.rstrip(".") for action in actions[moments - 1:]) + "."]
         views = [moments // len(actions) + (1 if index < moments % len(actions) else 0) for index in range(len(actions))]
         moments_text = []
         for action, count in zip(actions, views):
@@ -1129,6 +1592,10 @@ def _complete_shot_plan(data: object, state: AgentState) -> dict:
             continue
         if duration <= 0 or any(weight <= 0 for weight in weights):
             continue
+        min_shot = min_billed_seconds(state) * float(PIPELINE_CONFIG["shot_grammar"]["min_shot_seconds_ratio"])
+        if any(duration * weight / sum(weights) < min_shot for weight in weights) and duration >= min_shot * len(shots):
+            # A very short shot still pays for a full clip, so share the scene evenly instead.
+            weights = [1.0] * len(shots)
         allocated = 0.0
         for shot, weight in zip(shots[:-1], weights[:-1]):
             shot["estimated_duration_seconds"] = round(duration * weight / sum(weights), 3)
@@ -1202,11 +1669,19 @@ def _validate_shot_plan(data: object, state: AgentState) -> list[dict]:
             raise RuntimeError("Shot characters_present must use exact approved character IDs, not display names.")
         # A character named in the visible action is drawn by the image model, so it needs its reference sheet.
         depicted = " ".join(str(shot.get(key, "")) for key in ("visual_action", "visual_focus", "composition"))
-        for alias, character_id in cast.items():
-            if character_id not in characters and re.search(rf"\b{re.escape(alias)}\b", depicted, re.IGNORECASE):
-                characters.append(character_id)
-        if not set(characters) <= scene_characters:
-            raise RuntimeError("Shot includes a character outside its approved scene.")
+        characters.extend(
+            character_id for character_id in _named_characters(depicted, cast) if character_id not in characters
+        )
+        outside = [character_id for character_id in characters if character_id not in scene_characters]
+        if outside:
+            # Name the shot and the character, so the retry can fix it instead of repeating it.
+            names = {character_id: alias for alias, character_id in cast.items() if alias != character_id.casefold()}
+            raise RuntimeError(
+                f"{shot['shot_id']} shows {', '.join(f'{names.get(item, item)} ({item})' for item in outside)}, "
+                f"who is not in {scene_id} (allowed: {', '.join(sorted(scene_characters)) or 'nobody'}). "
+                "Remove them from characters_present and from visual_action, visual_focus, and composition; "
+                "a line spoken to them does not put them on screen."
+            )
         for key in (
             "primary_subject", "visual_action", "visual_focus", "framing", "camera_angle",
             "composition", "emotion", "continuity_in", "continuity_out", "shot_purpose",

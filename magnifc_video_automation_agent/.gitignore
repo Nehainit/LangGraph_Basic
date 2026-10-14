@@ -12,3 +12,8 @@ frontend/*.mp4
 .claim-flow-work/
 Untitled.ipynb
 notes.txt
+/library/
+
+# Free CC0 sound library audio is rebuilt from library.json with: python -m video_automation.sound_library build
+assets/sound_library/sfx/
+assets/sound_library/music/

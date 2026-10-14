@@ -14,6 +14,7 @@ dependencies = [
     "minio",
     "pillow",
     "pydantic",
+    "PyJWT[crypto]",
     "python-dotenv",
     "PyYAML",
     "uvicorn",

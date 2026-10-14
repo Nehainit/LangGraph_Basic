@@ -200,3 +200,61 @@ def test_ffmpeg_extracts_chronological_frames(tmp_path):
     frames, frame_times = judge.extract_video_frames(str(video), 1.0, str(tmp_path / "frames"))
     assert frames
     assert frame_times == sorted(frame_times)
+
+
+def test_judge_runs_with_the_paid_openai_chain(tmp_path, monkeypatch):
+    # The judge used to skip itself unless MODEL_PROVIDER=ollama; under auto it now uses the video_judge chain.
+    monkeypatch.setenv("MODEL_PROVIDER", "auto")
+    mock_frames(tmp_path, monkeypatch)
+    calls = []
+
+    def invoke(agent_name, prompt, image_files, *, purpose):
+        calls.append(agent_name)
+        return SimpleNamespace(content=json.dumps(report())), {"agent": agent_name}
+
+    monkeypatch.setattr(judge, "invoke_with_images_and_evaluation", invoke)
+    result = judge.combined_video_judge(state(tmp_path))
+
+    assert calls == ["combined-video-judge"]
+    assert result["combined_video_judge_status"] == "accepted"
+    from video_automation.models import _chain
+    assert _chain("combined-video-judge")[0] == {
+        "provider": "openai", "model": "gpt-5", "usd_per_1m_input": 1.25, "usd_per_1m_output": 10.0,
+    }
+
+
+def test_judge_gets_frames_inside_every_spoken_line_for_lip_sync(tmp_path, monkeypatch):
+    mock_frames(tmp_path, monkeypatch)
+    sampled = []
+
+    def frames_at(_video, times, _directory):
+        sampled.extend(times)
+        return [str(tmp_path / f"line-{index}.jpg") for index in range(len(times))]
+
+    monkeypatch.setattr(judge, "extract_frames_at", frames_at)
+    seen = {}
+
+    def invoke(agent_name, prompt, image_files, *, purpose):
+        seen.update(prompt=prompt, image_files=image_files)
+        return SimpleNamespace(content=json.dumps(report())), {"agent": agent_name}
+
+    monkeypatch.setattr(judge, "invoke_with_images_and_evaluation", invoke)
+    current = state(tmp_path)
+    current["narration_segments"] = [
+        {"segment_id": "segment-001", "speaker_name": "Mango Rani", "text": "वह कौन थी?"},
+        {"segment_id": "segment-002", "text": "A narrator line has no speaker."},
+    ]
+    # The line is spoken from 1.0 to 2.0 s; its timing runs on through the pause to 3.0 s.
+    current["narration_segment_timings"] = [
+        {"segment_id": "segment-001", "start_seconds": 1.0, "end_seconds": 3.0, "speech_end_seconds": 2.0},
+        {"segment_id": "segment-002", "start_seconds": 3.0, "end_seconds": 4.0},
+    ]
+
+    judge.combined_video_judge(current)
+
+    assert sampled == [1.25, 1.5, 1.75]
+    assert seen["image_files"][1:4] == [str(tmp_path / f"line-{index}.jpg") for index in range(3)]
+    payload = seen["prompt"].split("Approved inputs:\n", 1)[1]
+    lines = json.loads(payload)["spoken_line_frames"]
+    assert [(item["image_index"], item["speaker"]) for item in lines] == [(2, "Mango Rani"), (3, "Mango Rani"), (4, "Mango Rani")]
+    assert "Lip sync" in seen["prompt"]

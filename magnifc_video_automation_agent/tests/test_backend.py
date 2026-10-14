@@ -480,6 +480,49 @@ def test_approve_retries_failed_downstream_node():
     assert failed_graph.inputs == [None]
 
 
+
+def test_retrying_a_review_resumes_a_step_that_crashed_after_it():
+    class CrashedGraph:
+        def __init__(self):
+            self.inputs = []
+
+        def get_state(self, _config):
+            # The shot plan was accepted, then build_image_prompts raised; the page still shows the shot plan review.
+            return SimpleNamespace(
+                next=("build_image_prompts",), values={},
+                tasks=(SimpleNamespace(name="build_image_prompts", error=RuntimeError("provider failed")),),
+            )
+
+        def invoke(self, value, _config):
+            self.inputs.append(value)
+            return {"story": "Story.", "storyboard": [], "warnings": [], "video_file": None}
+
+    original_graph = backend.graph
+    crashed = CrashedGraph()
+    backend.graph = crashed
+    try:
+        backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"))
+    finally:
+        backend.graph = original_graph
+
+    assert crashed.inputs == [None]
+
+
+def test_review_of_a_finished_run_is_still_not_found():
+    class FinishedGraph:
+        def get_state(self, _config):
+            return SimpleNamespace(next=(), values={}, tasks=())
+
+    original_graph = backend.graph
+    backend.graph = FinishedGraph()
+    try:
+        with pytest.raises(backend.HTTPException) as error:
+            backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"))
+    finally:
+        backend.graph = original_graph
+
+    assert error.value.status_code == 404
+
 if __name__ == "__main__":
     test_web_story_then_visual_storyboard_flow()
     test_rejects_duration_outside_supported_range()

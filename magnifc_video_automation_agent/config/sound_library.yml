@@ -1,0 +1,49 @@
+version: 1
+
+# Free sound effects and music from Freesound.org, built once into assets/sound_library and reused by every film.
+# Only Creative Commons 0 sounds are kept: no credit needed and safe for monetized YouTube and Instagram videos.
+# Build or refresh it with:  python -m video_automation.sound_library build   (needs FREESOUND_API_KEY in .env)
+sound_library:
+  folder: assets/sound_library
+  license_filter: 'license:"Creative Commons 0"'
+  # Sounds per tag kept in the library; the planner picks among them.
+  per_tag: 2
+  # A sound needs at least this many downloads, so obscure low-quality uploads are skipped.
+  min_downloads: 50
+
+  sfx:
+    - {tag: dramatic_sting, query: "dramatic sting", seconds: [1, 6]}
+    - {tag: cinematic_hit, query: "cinematic boom hit", seconds: [1, 6]}
+    - {tag: crowd_gasp, query: "crowd gasp", seconds: [1, 5]}
+    - {tag: gasp, query: "female gasp surprise", seconds: [0.5, 3]}
+    - {tag: whoosh, query: "whoosh transition", seconds: [0.5, 3]}
+    - {tag: tension_riser, query: "tension riser", seconds: [2, 8]}
+    - {tag: heartbeat, query: "heartbeat", seconds: [2, 10]}
+    - {tag: record_scratch, query: "record scratch", seconds: [0.5, 3]}
+    - {tag: magic_chime, query: "magic chime sparkle", seconds: [1, 5]}
+    - {tag: gate_creak, query: "gate creak open", seconds: [1, 6]}
+    - {tag: door_open, query: "door open", seconds: [1, 5]}
+    - {tag: footsteps, query: "footsteps", seconds: [2, 8]}
+    - {tag: suspense_drone, query: "suspense drone", seconds: [4, 15]}
+    - {tag: crowd_laugh, query: "crowd laugh", seconds: [2, 8]}
+    - {tag: applause, query: "applause", seconds: [2, 10]}
+    - {tag: thunder, query: "thunder", seconds: [2, 10]}
+    - {tag: water_splash, query: "water splash", seconds: [0.5, 4]}
+    - {tag: comedy_boing, query: "cartoon boing", seconds: [0.3, 3]}
+
+  music:
+    - {tag: suspense, query: "suspense music", seconds: [30, 240]}
+    - {tag: mystery, query: "mystery ambient music", seconds: [30, 240]}
+    - {tag: romantic, query: "romantic piano music", seconds: [30, 240]}
+    - {tag: comedy, query: "funny music", seconds: [20, 240]}
+    - {tag: epic, query: "epic cinematic music", seconds: [30, 240]}
+    - {tag: devotional, query: "sitar", seconds: [20, 240]}
+    - {tag: happy, query: "happy upbeat music", seconds: [30, 240]}
+    - {tag: sad, query: "sad piano music", seconds: [30, 240]}
+
+  cues:
+    # At most one effect per this many seconds of film, so effects punctuate rather than clutter.
+    seconds_per_cue: 4
+    # Effects never start closer together than this.
+    min_gap_seconds: 1.5
+    volume: 0.6

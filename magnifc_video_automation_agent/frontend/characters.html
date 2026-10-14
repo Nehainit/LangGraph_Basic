@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f6f2">
+  <meta name="description" content="Design your characters once and reuse them in every film.">
+  <title>Characters · Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%231d6ef2'/%3E%3Cpath d='M15 11v18l14-9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400..700&family=Source+Serif+4:opsz,wght@8..60,600..700&display=swap">
+  <link rel="stylesheet" href="/static/studio.css">
+  <link rel="stylesheet" href="/static/characters.css">
+  <script type="module" src="/static/characters.js"></script>
+</head>
+<body class="characters-page">
+  <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-camera" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="3.5"/><circle cx="14" cy="5.5" r="3.5"/><rect x="1" y="9" width="16" height="12" rx="2.5"/><path d="m18 13 5-3v10l-5-3z"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M10 3.5 11.8 9 17 11l-5.2 2L10 18.5 8.2 13 3 11l5.2-2z"/><path d="M18.5 2.5 19.3 4.7 21.5 5.5l-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m6.5 12.5 3.5 3.5 7.5-8"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5m6-6-6 6 6 6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.5L4 8m0-4v4h4M4 13a8 8 0 0 0 14.6 4.5L20 16m0 4v-4h-4"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Studio home"><svg class="brand-icon"><use href="#i-camera"/></svg>Studio</a>
+    <nav class="tabs" aria-label="Views">
+      <a class="tab" href="/">Create</a>
+      <a class="tab" href="/#writer">Story writer</a>
+      <a class="tab is-active" href="/characters" aria-current="page">Characters</a>
+      <a class="tab" href="/#films">My films</a>
+    </nav>
+    <div class="account" id="userButton"></div>
+  </header>
+
+  <main class="main">
+    <!-- Library -->
+    <section class="library" id="libraryView" aria-labelledby="libraryTitle">
+      <div class="library-head">
+        <div>
+          <p class="eyebrow">Character library</p>
+          <h1 class="headline small" id="libraryTitle">Your characters</h1>
+          <p class="subhead">Design a character once. Keep their look in every film.</p>
+        </div>
+        <a class="primary-button compact" href="#new"><svg class="icon"><use href="#i-plus"/></svg>New character</a>
+      </div>
+      <div class="char-grid" id="charGrid"></div>
+      <div class="empty" id="charEmpty" hidden>
+        <p>No characters yet. Describe one and we’ll draw their character sheet and emotion board.</p>
+        <a class="secondary-button" href="#new">Create your first character</a>
+      </div>
+      <p class="field-error" id="libraryError" role="alert" hidden></p>
+    </section>
+
+    <!-- Editor -->
+    <section class="editor" id="editorView" aria-labelledby="formTitle" hidden>
+      <a class="link-button back-link" href="#"><svg class="icon"><use href="#i-back"/></svg>All characters</a>
+      <p class="notice return-note" id="returnNote" hidden></p>
+
+      <div class="editor-grid">
+        <form class="settings char-form" id="charForm" novalidate>
+          <div>
+            <p class="eyebrow" id="formEyebrow">New character</p>
+            <h2 class="settings-title" id="formTitle">Who are they?</h2>
+          </div>
+
+          <div class="field">
+            <label for="name">Name</label>
+            <input id="name" name="name" maxlength="60" required autocomplete="off" placeholder="Meera">
+          </div>
+          <div class="field">
+            <label for="kind">Who or what <span>species, age, role</span></label>
+            <input id="kind" name="kind" maxlength="200" required autocomplete="off" placeholder="A curious 8-year-old girl from Jaipur">
+          </div>
+
+          <fieldset class="field">
+            <legend>Style <span>fixed for this character</span></legend>
+            <div class="mini-styles">
+              <label class="style-card"><input type="radio" name="visual_style" value="realistic"><span class="style-img"><img src="/static/styles/realistic.jpg" alt=""><span class="badge"><svg><use href="#i-check"/></svg></span></span><span class="style-name">Realistic</span></label>
+              <label class="style-card"><input type="radio" name="visual_style" value="cinematic"><span class="style-img"><img src="/static/styles/cinematic.jpg" alt=""><span class="badge"><svg><use href="#i-check"/></svg></span></span><span class="style-name">Cinematic</span></label>
+              <label class="style-card"><input type="radio" name="visual_style" value="illustrated" checked><span class="style-img"><img src="/static/styles/illustrated.jpg" alt=""><span class="badge"><svg><use href="#i-check"/></svg></span></span><span class="style-name">Illustrated</span></label>
+              <label class="style-card"><input type="radio" name="visual_style" value="3d_animation"><span class="style-img"><img src="/static/styles/3d_animation.jpg" alt=""><span class="badge"><svg><use href="#i-check"/></svg></span></span><span class="style-name">3D</span></label>
+              <label class="style-card"><input type="radio" name="visual_style" value="anime"><span class="style-img"><img src="/static/styles/anime.jpg" alt=""><span class="badge"><svg><use href="#i-check"/></svg></span></span><span class="style-name">Anime</span></label>
+            </div>
+          </fieldset>
+
+          <div class="field">
+            <span class="field-label" id="refsLabel">Reference images <span>optional · up to 3 photos or drawings</span></span>
+            <div class="refs" id="refs" role="group" aria-labelledby="refsLabel"></div>
+            <p class="field-hint">We match their look from these. Only upload images you have the right to use; they stay private in your library.</p>
+          </div>
+
+          <div class="field">
+            <label for="appearance">Appearance <span>face, eyes, hair, skin or fur, build</span></label>
+            <textarea id="appearance" name="appearance" rows="3" maxlength="1200" placeholder="Round face, big brown eyes, two long black braids with red ribbons, warm brown skin, small and lively"></textarea>
+          </div>
+          <div class="field">
+            <label for="outfit">Outfit</label>
+            <textarea id="outfit" name="outfit" rows="2" maxlength="600" placeholder="Yellow kurta with white embroidery, blue leggings, brown sandals"></textarea>
+          </div>
+          <div class="field">
+            <label for="props">Props <span>optional</span></label>
+            <input id="props" name="props" maxlength="300" autocomplete="off" placeholder="A small green school bag">
+          </div>
+
+          <p class="field-error" id="formError" role="alert" hidden></p>
+          <button class="primary-button" type="submit" id="saveButton">Draw my character</button>
+          <p class="caption" id="formCaption"></p>
+        </form>
+
+        <div class="boards-col">
+          <section class="board-card" id="sheetCard" aria-labelledby="sheetTitle">
+            <header class="board-head">
+              <h3 class="block-title" id="sheetTitle">Character sheet</h3>
+              <span class="board-meta">Side · front · back · face</span>
+            </header>
+            <div class="board-frame" data-board="sheet"></div>
+            <p class="notice stale" data-stale hidden></p>
+            <form class="tweak" data-tweak="sheet" hidden>
+              <label class="visually-hidden" for="sheetNote">Change something on the sheet</label>
+              <input id="sheetNote" name="note" maxlength="500" autocomplete="off" placeholder="Change something, e.g. make her scarf red">
+              <button class="secondary-button" type="submit">Apply change</button>
+              <button class="link-button" type="button" data-fresh="sheet"><svg class="icon"><use href="#i-refresh"/></svg>Try a new look</button>
+            </form>
+            <p class="field-error" data-error hidden></p>
+          </section>
+
+          <section class="board-card" id="emotionsCard" aria-labelledby="emotionsTitle">
+            <header class="board-head">
+              <h3 class="block-title" id="emotionsTitle">Emotion board</h3>
+              <ul class="emotion-chips" id="emotionChips" aria-label="Emotions on the board"></ul>
+            </header>
+            <div class="board-frame" data-board="emotions"></div>
+            <p class="notice stale" data-stale hidden></p>
+            <form class="tweak" data-tweak="emotions" hidden>
+              <label class="visually-hidden" for="emotionsNote">Change something on the emotion board</label>
+              <input id="emotionsNote" name="note" maxlength="500" autocomplete="off" placeholder="Change something, e.g. make 'angry' less fierce">
+              <button class="secondary-button" type="submit">Apply change</button>
+              <button class="link-button" type="button" data-fresh="emotions"><svg class="icon"><use href="#i-refresh"/></svg>Redraw all</button>
+            </form>
+            <p class="field-error" data-error hidden></p>
+          </section>
+
+          <div class="editor-foot" id="editorFoot" hidden>
+            <span id="spent"></span>
+            <button class="link-button danger" type="button" id="deleteButton">Delete character</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog class="player-dialog image-dialog" id="imageDialog">
+    <div class="dialog-head">
+      <h2 id="imageTitle"></h2>
+      <button class="close-button" type="button" data-close aria-label="Close">×</button>
+    </div>
+    <img id="imageFull" alt="">
+  </dialog>
+
+  <dialog class="player-dialog confirm-dialog" id="deleteDialog">
+    <form method="dialog">
+      <div class="dialog-head"><h2>Delete <span id="deleteName"></span>?</h2></div>
+      <p>Their details, character sheets, and emotion boards are removed from your library. This can’t be undone.</p>
+      <div class="actions">
+        <button class="secondary-button" value="cancel">Keep</button>
+        <button class="primary-button compact danger-button" value="delete">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

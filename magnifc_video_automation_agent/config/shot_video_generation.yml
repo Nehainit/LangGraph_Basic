@@ -5,7 +5,6 @@ shot_video_generation:
   provider: magnific
   model_used: kling-v2-6-pro
   output_format: mp4
-  allowed_duration_seconds: [5, 10]
   default_aspect_ratio: "9:16"
   aspect_ratios:
     "16:9": widescreen_16_9

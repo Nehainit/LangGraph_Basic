@@ -137,6 +137,7 @@ def build_story_graph(
 
     def route_visual(state: AgentState) -> str:
         if state.get("visual_approved"):
+            # Plans already exist from before the review; only shots redrawn since then are replanned.
             return "plan_motion"
         if state.get("visual_feedback"):
             return "create_storyboard"
@@ -152,7 +153,8 @@ def build_story_graph(
             and state.get("shot_image_qa_round", 0) <= int(SHOT_IMAGE_QA_CONFIG["max_retries"])
         ):
             return "create_storyboard"
-        return "review_visual_storyboard"
+        # Motion is planned before the storyboard review, so each shot's video tier and price can be shown there.
+        return "plan_motion"
 
     def route_video_validation(state: AgentState) -> str:
         if state.get("video_validation_exhausted_shots"):
@@ -176,7 +178,9 @@ def build_story_graph(
         }.get(state.get("rough_cut_failure_source"), END)
 
     def route_motion(state: AgentState) -> str:
-        return "review_shot_plan" if state.get("motion_plan_needs_revision") else "create_scene_videos"
+        if state.get("motion_plan_needs_revision"):
+            return "review_shot_plan"
+        return "create_scene_videos" if state.get("visual_approved") else "review_visual_storyboard"
 
     if reference_creator is create_reference_package:
         script_creator = narration_script_creator

@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from video_automation.schema import AgentState
+from video_automation.agents.editor_agent import punch_in_allowed, punch_in_filters
 from video_automation.agents.video_validator import _decodes, _fps, _number, _probe
 
 
@@ -174,16 +175,26 @@ def _preconditions(state: AgentState) -> tuple[list[dict], list[dict], float | N
     return timeline, issues, timeline_duration
 
 
-def build_ffmpeg_command(timeline: list[dict], narration_file: str, output_file: str, *, width: int, height: int, fps: float, duration: float) -> list[str]:
+def build_ffmpeg_command(
+    timeline: list[dict], narration_file: str, output_file: str, *, width: int, height: int, fps: float, duration: float,
+    punch_in_shots: set[str] | None = None,
+) -> list[str]:
     inputs = [part for item in timeline for part in ("-i", str(item["video_file"]))]
     inputs.extend(["-i", narration_file])
     filters = []
     for index, item in enumerate(timeline):
-        filters.append(
+        chain = (
             f"[{index}:v]trim=start={float(item['source_in']):.6f}:end={float(item['source_out']):.6f},"
             f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},fps={fps},format={VIDEO_COMPILATION_CONFIG['pixel_format']}[v{index}]"
+            f"crop={width}:{height},fps={fps}"
         )
+        if item.get("shot_id") in (punch_in_shots or set()):
+            segment = float(item["source_out"]) - float(item["source_in"])
+            filters.append(f"{chain}[s{index}]")
+            filters.extend(punch_in_filters(f"[s{index}]", f"[p{index}]", width, height, segment, f"pi{index}"))
+            filters.append(f"[p{index}]format={VIDEO_COMPILATION_CONFIG['pixel_format']}[v{index}]")
+        else:
+            filters.append(f"{chain},format={VIDEO_COMPILATION_CONFIG['pixel_format']}[v{index}]")
     current = "[v0]"
     for index in range(1, len(timeline)):
         output = f"[joined{index}]"
@@ -240,9 +251,17 @@ def compile_rough_video(state: AgentState) -> dict:
     out = Path(state.get("output_dir", "outputs")) / "rough_cut"
     out.mkdir(parents=True, exist_ok=True)
     rough_cut = out / "rough_cut_v001.mp4"
+    shots = {shot["shot_id"]: shot for shot in state.get("shot_plan") or []}
+    providers = {item.get("shot_id"): item.get("provider") for item in state.get("generated_videos") or []}
     command = build_ffmpeg_command(
         timeline, state["narration_file"], str(rough_cut),
         width=width, height=height, fps=fps, duration=float(timeline_duration),
+        punch_in_shots={
+            item["shot_id"] for item in timeline
+            if punch_in_allowed(
+                shots.get(item["shot_id"]), float(item["source_out"]) - float(item["source_in"]), providers.get(item["shot_id"]),
+            )
+        },
     )
     try:
         _run_ffmpeg(command)

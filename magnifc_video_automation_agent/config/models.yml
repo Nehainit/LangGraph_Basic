@@ -18,6 +18,14 @@ routing:
       - {provider: gemini, model: gemini-3.5-flash-lite}
       - {provider: gemini, model: gemma-4-26b-a4b-it}
       - {provider: ollama, model: qwen2.5:3b-instruct}
+    # The voice-over script is what the viewer hears, so it gets a stronger writer. One short call per film,
+    # well under one cent; free tiers back it up.
+    writing:
+      - {provider: openai, model: gpt-5-mini, usd_per_1m_input: 0.25, usd_per_1m_output: 2.00}
+      - {provider: openai, model: gpt-5-nano, usd_per_1m_input: 0.05, usd_per_1m_output: 0.40}
+      - {provider: groq, model: openai/gpt-oss-120b}
+      - {provider: gemini, model: gemini-3.6-flash}
+      - {provider: ollama, model: qwen2.5:3b-instruct}
     # Stages that look at images. Groq's free tier has no vision model, so it is not listed.
     vision:
       - {provider: openai, model: gpt-5-nano, usd_per_1m_input: 0.05, usd_per_1m_output: 0.40}
@@ -28,7 +36,14 @@ routing:
       - {provider: gemini, model: gemma-4-31b-it}
       - {provider: ollama, model: qwen2.5vl:3b}
 
+    # The final judge looks at the whole film once (sampled frames, dialogue timing, approved images), so it gets
+    # OpenAI's strongest vision model: a few cents per film. Prices checked 2026-10-14.
+    video_judge:
+      - {provider: openai, model: gpt-5, usd_per_1m_input: 1.25, usd_per_1m_output: 10.00}
+      - {provider: openai, model: gpt-5-mini, usd_per_1m_input: 0.25, usd_per_1m_output: 2.00}
+
   # Stages not listed here use the text chain.
   stages:
+    narration: writing
     shot-image-qa: vision
-    combined-video-judge: vision
+    combined-video-judge: video_judge

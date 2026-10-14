@@ -113,7 +113,7 @@ def review_reference_package(state: AgentState):
             "stage": "reference_board_review",
             "production_bible": state["production_bible"],
             "character_board_file": state["character_board_file"],
-            "mood_board_file": state["mood_board_file"],
+            "mood_board_file": state.get("mood_board_file", ""),
             "actions": ["approve", "regenerate"],
             "feedback": state.get("last_reference_feedback", ""),
         }
@@ -173,9 +173,10 @@ def review_visual_storyboard(state: AgentState):
         {
             "stage": "visual_storyboard_review",
             "storyboard": state["storyboard"],
-            "mood_board_file": state["mood_board_file"],
+            "mood_board_file": state.get("mood_board_file", ""),
             "image_files": state["image_files"],
             "shot_image_qa_results": state.get("shot_image_qa_results", []),
+            "motion_plans": state.get("motion_plans", []),
             "actions": ["approve", "regenerate"],
             "feedback": state.get("last_visual_feedback", []),
         }
@@ -202,4 +203,18 @@ def review_visual_storyboard(state: AgentState):
             ],
         }
 
+    overrides = decision.get("video_tiers") or {}
+    if overrides:
+        # The reviewer's tier choice wins over the automatic router for the shots they changed.
+        from video_automation.agents.motion_planner_agent import route_video_tiers
+
+        plans = [
+            {**plan, "video_tier": overrides[plan["shot_id"]], "tier_source": "user", "tier_reason": "Chosen on the storyboard."}
+            if overrides.get(plan["shot_id"]) and overrides[plan["shot_id"]] != plan.get("video_tier") else plan
+            for plan in state.get("motion_plans", [])
+        ]
+        return {
+            "visual_approved": True, "visual_feedback": [],
+            "motion_plans": route_video_tiers(state, state.get("shot_plan") or [], plans),
+        }
     return {"visual_approved": True, "visual_feedback": []}

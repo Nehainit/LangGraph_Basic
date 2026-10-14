@@ -101,6 +101,25 @@ def test_image_prompt_builder_preserves_approved_shot_and_references(monkeypatch
     assert result["llm_evaluations"] == []
 
 
+def test_still_frame_check_ignores_quoted_dialogue_but_not_staging():
+    shot = {
+        "visual_action": "Draupadi declares: 'Then let your arrow guard dharma, and I will walk beside it.'",
+        "visual_focus": "Draupadi", "framing": "medium", "camera_angle": "eye_level",
+        "composition": "centered", "emotion": "resolute", "characters_present": [],
+    }
+    location = {"description": "moonlit courtyard"}
+    prompt = " ".join([shot["visual_action"], "Draupadi medium eye_level centered resolute moonlit courtyard ink"])
+
+    assert image_agent._validate_image_prompt({"image_prompt": prompt}, shot, location, "ink", {})
+
+    staged = {**shot, "visual_action": "Draupadi turns, then raises her hand."}
+    with pytest.raises(RuntimeError, match="one still frame"):
+        image_agent._validate_image_prompt(
+            {"image_prompt": prompt.replace(shot["visual_action"], staged["visual_action"])},
+            staged, location, "ink", {},
+        )
+
+
 def test_image_prompt_request_validator_reports_traceability_mismatches():
     approved = {
         "shot_id": "shot-001", "scene_id": "scene-001", "visual_beat_ids": ["vb-001"],
@@ -1077,20 +1096,17 @@ def test_sequence_words_in_continuity_notes_do_not_fail_the_image_prompt():
     assert "then naps" not in prompt
 
 
-def test_still_frame_check_ignores_quoted_dialogue_but_not_staging():
+def test_still_frame_check_allows_an_animated_visual_style():
+    style = "Polished 3D animated feature-film look"
     shot = {
-        "visual_action": "Draupadi declares: 'Then let your arrow guard dharma, and I will walk beside it.'",
-        "visual_focus": "Draupadi", "framing": "medium", "camera_angle": "eye_level",
-        "composition": "centered", "emotion": "resolute", "characters_present": [],
+        "visual_action": "Mango Rani folds her arms beside the pool",
+        "visual_focus": "Mango Rani", "framing": "medium", "camera_angle": "eye_level",
+        "composition": "centered", "emotion": "suspicious", "characters_present": [],
     }
-    location = {"description": "moonlit courtyard"}
-    prompt = " ".join([shot["visual_action"], "Draupadi medium eye_level centered resolute moonlit courtyard ink"])
+    location = {"description": "villa pool at night"}
+    prompt = f"{shot['visual_action']}. Mango Rani medium eye_level centered suspicious villa pool at night, cute 3D animated fruit characters. {style}"
 
-    assert image_agent._validate_image_prompt({"image_prompt": prompt}, shot, location, "ink", {})
+    assert image_agent._validate_image_prompt({"image_prompt": prompt}, shot, location, style, {})
 
-    staged = {**shot, "visual_action": "Draupadi turns, then raises her hand."}
-    with pytest.raises(RuntimeError, match="one still frame"):
-        image_agent._validate_image_prompt(
-            {"image_prompt": prompt.replace(shot["visual_action"], staged["visual_action"])},
-            staged, location, "ink", {},
-        )
+    with pytest.raises(RuntimeError, match='found "animate"'):
+        image_agent._validate_image_prompt({"image_prompt": prompt + " Animate her turning around."}, shot, location, style, {})

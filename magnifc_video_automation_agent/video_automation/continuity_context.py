@@ -1,6 +1,17 @@
+import re
 from typing import Any
 
 DEFAULT_VISUAL_STYLE = "cinematic storybook illustration"
+
+
+def library_character_for(name: str, state: dict[str, Any]) -> dict[str, Any] | None:
+    """The saved library character a story character refers to, matched by name ("Meera" also matches "Meera Sharma")."""
+    name = str(name).strip()
+    for character in state.get("library_characters") or []:
+        saved = str(character.get("name", "")).strip()
+        if saved and (saved.casefold() == name.casefold() or re.search(rf"(?<!\w){re.escape(saved)}(?!\w)", name, re.IGNORECASE)):
+            return character
+    return None
 
 
 def character_definitions(state: dict[str, Any]) -> list[dict[str, str]]:

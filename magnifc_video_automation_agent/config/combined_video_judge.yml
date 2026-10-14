@@ -7,6 +7,8 @@ combined_video_judge:
   max_inference_retries: 1
   timestamp_tolerance_seconds: 0.25
   sample_frames: 12
+  # Extra frames inside every line a character speaks, so lip sync can be judged.
+  frames_per_spoken_line: 3
   frame_max_width: 960
   ffmpeg_timeout_seconds: 120
   system_prompt: |-
@@ -32,6 +34,16 @@ combined_video_judge:
     narration alignment at the actual spoken time; unsupported actions, characters, events, or
     sequence changes; emotional intent; shot duration, cut timing, holds, transitions, pacing; and
     the coherence of the complete video.
+
+    When narration segments carry a speaker, the film has no narrator: each line is spoken by that character in
+    their own voice at its timestamps. Check that the speaking character is on screen at that time. Silent
+    stretches where the picture carries the action are intended, not missing narration.
+
+    Lip sync: spoken_line_frames are three frames taken inside each spoken line, labelled with the speaker.
+    Compare the speaker's mouth across those three frames. If the speaker is on screen but the mouth is closed or
+    unchanged in all three, or another character's mouth moves instead, report a major issue of type lip_sync
+    for that line's time range with failure_source video_generation, and score narration_alignment at most 5.
+    If the speaker is not on screen during their own line, report it as shot_alignment.
 
     Every meaningful issue must include a nonempty issue type, severity, concrete evidence,
     correction, failure source, retry target, and start_sec/end_sec. Use null timestamps only when

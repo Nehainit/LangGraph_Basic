@@ -3,14 +3,81 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from video_automation.continuity_context import continuity_context
+from video_automation.cost_control import video_model_for_tier, video_price
+from video_automation.model_catalog import VIDEO_TIERS
 from video_automation.models import invoke_with_evaluation, load_model
-from video_automation.prompts import MOTION_PLANNING_CONFIG, MOTION_PLANNING_SYSTEM_PROMPT
+from video_automation.prompts import MOTION_PLANNING_CONFIG, MOTION_PLANNING_SYSTEM_PROMPT, PIPELINE_CONFIG
 from video_automation.schema import AgentState
 from video_automation.agents.story_agent import _parse_json
 
 
 INTENSITIES = {"none", "very_low", "low", "medium", "high"}
 CAMERA_MOTIONS = {"static", "subtle_push_in", "subtle_pull_back", "slow_pan", "gentle_tilt", "small_lateral_tracking"}
+CALM = {"none", "very_low"}
+REALISTIC_STYLES = ("realistic", "cinematic")
+
+
+def _tier_rule(shot: dict, plan: dict, realistic: bool) -> tuple[str, str]:
+    """Pick the cheapest video tier that can carry the shot, and say why."""
+    subject = plan["subject_motion"]["intensity"]
+    environment = plan["environment_motion"]["intensity"]
+    characters = shot.get("characters_present") or []
+    close_up = "close" in str(shot.get("framing", "")).casefold()
+    if realistic:
+        return "premium", "Realistic style needs the strongest video model to keep faces believable."
+    if subject == "high":
+        return "premium", "Fast or complex body action."
+    if len(characters) >= 2 and subject == "medium":
+        return "premium", "Two or more characters interact on screen."
+    if close_up and characters and subject not in CALM:
+        return "premium", "Close-up of a face changing expression."
+    if subject in CALM and environment in CALM | {"low"}:
+        return "static", "Calm shot: camera movement over the still frame is enough."
+    return "standard", "Ordinary character motion."
+
+
+def route_video_tiers(state: AgentState, shots: list[dict], plans: list[dict]) -> list[dict]:
+    """Give every motion plan a video tier, model and price; a reviewer's choice is never overridden.
+
+    Guards: the first shot (the hook) is never static, two static shots never follow each other, and at most
+    one shot per video_tiers.shots_per_static is static. A plan without premium video gets standard instead.
+    """
+    policy = PIPELINE_CONFIG["video_tiers"]
+    style = f"{state.get('visual_style') or ''} {continuity_context(state)['visual_style']}".casefold()
+    realistic = any(name in style for name in REALISTIC_STYLES)
+    max_static = len(plans) // max(1, int(policy["shots_per_static"])) if policy["allow_static"] else 0
+    shot_by_id = {shot["shot_id"]: shot for shot in shots}
+    routed, static_count, previous_static = [], 0, False
+    for index, plan in enumerate(plans):
+        if plan.get("tier_source") == "user" and plan.get("video_tier") in VIDEO_TIERS:
+            tier, reason, source = plan["video_tier"], plan.get("tier_reason") or "Chosen on the storyboard.", "user"
+        else:
+            tier, reason = _tier_rule(shot_by_id.get(plan["shot_id"], {}), plan, realistic)
+            source = "auto"
+            if tier == "static" and (index == 0 or previous_static or static_count >= max_static):
+                tier, reason = "standard", (
+                    "Opening shot is always animated." if index == 0 else "Keeps still shots spaced out; animated instead."
+                )
+            if tier == "premium" and not policy["allow_premium"]:
+                tier, reason = "standard", f"{reason} Premium video is not included in this plan."
+        static_count += tier == "static"
+        previous_static = tier == "static"
+        model = video_model_for_tier(state, tier)
+        duration = float(plan.get("duration_seconds") or 5)
+        try:
+            usd = round(video_price(state, duration, model), 4) if model else 0.0
+        except ValueError:
+            usd = None  # Longer than the model's longest clip; the generator falls back to FFmpeg motion.
+        routed.append({
+            **plan,
+            "video_tier": tier,
+            "tier_reason": reason,
+            "tier_source": source,
+            "video_model": model["id"] if model else "ffmpeg",
+            "estimated_usd": usd,
+        })
+    return routed
 
 
 def _validate_motion_plan(value: object, shot_id: str, duration: float) -> dict:
@@ -170,7 +237,7 @@ def create_motion_plans(state: AgentState) -> dict:
             if error:
                 warnings.append(f"{shot_id} used gentle default motion because motion planning failed.")
             slots[slot] = plan
-    plans = [plan for plan in slots if plan is not None]
+    plans = route_video_tiers(state, shots, [plan for plan in slots if plan is not None])
 
     return {
         "motion_plans": plans,

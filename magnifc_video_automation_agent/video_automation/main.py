@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None):
             result = graph.invoke(get_shot_review_command("visual storyboard"), config)
         elif "character_board_file" in review:
             print("Character board:", review["character_board_file"])
-            print("Mood board:", review["mood_board_file"])
+            print("Mood board:", review.get("mood_board_file"))
             result = graph.invoke(get_reference_review_command(), config)
         elif "director_plan" in review:
             print(json.dumps(review["director_plan"], indent=2))

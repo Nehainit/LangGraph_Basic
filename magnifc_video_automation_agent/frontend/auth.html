@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f6f2">
+  <meta name="description" content="Sign in to turn an idea into a narrated short film.">
+  <title>Sign in · Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%231d6ef2'/%3E%3Cpath d='M15 11v18l14-9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400..700&family=Source+Serif+4:opsz,wght@8..60,600..700&display=swap">
+  <link rel="stylesheet" href="/static/studio.css">
+  <link rel="stylesheet" href="/static/auth.css">
+  <script type="module" src="/static/auth-page.js"></script>
+</head>
+<body class="auth-body">
+  <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-camera" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="3.5"/><circle cx="14" cy="5.5" r="3.5"/><rect x="1" y="9" width="16" height="12" rx="2.5"/><path d="m18 13 5-3v10l-5-3z"/></symbol>
+  </svg>
+
+  <header class="topbar auth-topbar">
+    <a class="brand" href="/" aria-label="Studio home"><svg class="brand-icon"><use href="#i-camera"/></svg>Studio</a>
+    <span aria-hidden="true"></span>
+    <p class="auth-switch" id="authSwitch"></p>
+  </header>
+
+  <main class="auth-main">
+    <section class="auth-panel" aria-labelledby="authTitle">
+      <h1 class="headline small" id="authTitle">Welcome back.</h1>
+      <p class="auth-lede" id="authLede">Sign in to pick up your stories and films.</p>
+      <div class="auth-mount" id="authMount" aria-live="polite">
+        <p class="auth-loading">Loading sign-in…</p>
+      </div>
+    </section>
+
+    <figure class="auth-film">
+      <video id="authFilm" src="/examples/version-4-rabbit-turtle.mp4" poster="/examples/version-4-rabbit-turtle-poster.jpg" muted loop playsinline preload="metadata" aria-label="The rabbit and the turtle, a 17-second film made in the studio"></video>
+      <figcaption>
+        <span class="auth-prompt">“A rabbit challenges a quiet turtle to a race through the forest. Slow and steady wins the day.”</span>
+        <span class="auth-caption">One line in, a narrated 17-second film out.</span>
+      </figcaption>
+    </figure>
+  </main>
+</body>
+</html>

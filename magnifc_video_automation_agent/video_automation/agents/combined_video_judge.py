@@ -169,7 +169,10 @@ def _narration_segments(state: AgentState) -> list[dict]:
             **segment,
             **({
                 "start_sec": timing_by_id[segment.get("segment_id")].get("start_seconds"),
-                "end_sec": timing_by_id[segment.get("segment_id")].get("end_seconds"),
+                # Dialogue timings run on through the pause after a line; the judge needs when it is spoken.
+                "end_sec": timing_by_id[segment.get("segment_id")].get(
+                    "speech_end_seconds", timing_by_id[segment.get("segment_id")].get("end_seconds")
+                ),
             } if segment.get("segment_id") in timing_by_id else {}),
         }
         for segment in state.get("narration_segments", [])
@@ -218,6 +221,48 @@ def extract_video_frames(video_file: str, duration: float, output_dir: str) -> t
     if not frames:
         raise RuntimeError("FFmpeg did not extract any rough-cut frames.")
     return frames, [round(min(duration, index / rate), 3) for index in range(len(frames))]
+
+
+def extract_frames_at(video_file: str, times: list[float], output_dir: str) -> list[str]:
+    """One frame at each requested time, for close looks such as a mouth during a spoken line."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    width = int(COMBINED_VIDEO_JUDGE_CONFIG["frame_max_width"])
+    frames = []
+    for index, moment in enumerate(times, start=1):
+        output = Path(output_dir) / f"line-frame-{index:03}.jpg"
+        command = [
+            "ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, moment):.3f}", "-i", video_file, "-an",
+            "-vf", f"scale={width}:-2:force_original_aspect_ratio=decrease", "-frames:v", "1", "-q:v", "3", str(output),
+        ]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=float(COMBINED_VIDEO_JUDGE_CONFIG["ffmpeg_timeout_seconds"]),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Could not sample frames during spoken lines: {exc}") from exc
+        if completed.returncode or not output.is_file():
+            raise RuntimeError(f"Could not sample frames during spoken lines: {completed.stderr.strip()}")
+        frames.append(str(output))
+    return frames
+
+
+def _spoken_line_moments(segments: list[dict]) -> list[dict]:
+    """Three moments inside every line a character speaks, so the judge can compare the speaker's mouth."""
+    count = int(COMBINED_VIDEO_JUDGE_CONFIG.get("frames_per_spoken_line", 3))
+    moments = []
+    for segment in segments:
+        speaker = segment.get("speaker_name") or segment.get("speaker")
+        start, end = segment.get("start_sec"), segment.get("end_sec")
+        if not speaker or start is None or end is None or float(end) <= float(start) or count <= 0:
+            continue
+        span = float(end) - float(start)
+        for position in range(count):
+            moments.append({
+                "timestamp_sec": round(float(start) + span * (position + 1) / (count + 1), 3),
+                "speaker": speaker,
+                "line": segment.get("text", ""),
+            })
+    return moments
 
 
 def _image_retry_qa(state: AgentState, shot_ids: list[str], issues: list[dict]) -> list[dict]:
@@ -271,8 +316,6 @@ def combined_video_judge(state: AgentState) -> dict:
     rough_cut = state.get("rough_cut_file")
     if not COMBINED_VIDEO_JUDGE_CONFIG["enabled"]:
         return _controlled_failure(state, "Combined Video Judge is disabled.", model=model)
-    if os.getenv("MODEL_PROVIDER", "ollama").lower() != "ollama":
-        return _controlled_failure(state, "Combined Video Judge currently requires MODEL_PROVIDER=ollama.", model=model)
     if not rough_cut or not Path(rough_cut).is_file() or Path(rough_cut).stat().st_size == 0:
         return _controlled_failure(state, "The compiled rough-cut video is missing or empty.", model=model)
     timestamps = state.get("shot_timestamps") or []
@@ -285,6 +328,10 @@ def combined_video_judge(state: AgentState) -> dict:
         references, reference_order = _reference_media(state)
         with tempfile.TemporaryDirectory(prefix="combined-video-judge-") as frame_dir:
             frames, frame_times = extract_video_frames(rough_cut, float(duration), frame_dir)
+            # Lip sync needs frames close together inside each spoken line, not just across the film.
+            line_moments = _spoken_line_moments(_narration_segments(state))
+            line_start = len(frames) + 1
+            frames += extract_frames_at(rough_cut, [moment["timestamp_sec"] for moment in line_moments], frame_dir)
             reference_start = len(frames) + 1
             payload = {
                 "approved_story": state.get("story_outline") or state.get("story"),
@@ -302,6 +349,9 @@ def combined_video_judge(state: AgentState) -> dict:
                 "sampled_video_frames": [
                     {"image_index": index + 1, "timestamp_sec": timestamp}
                     for index, timestamp in enumerate(frame_times)
+                ],
+                "spoken_line_frames": [
+                    {"image_index": line_start + index, **moment} for index, moment in enumerate(line_moments)
                 ],
                 "reference_image_order": [
                     {**label, "image_index": reference_start + index}

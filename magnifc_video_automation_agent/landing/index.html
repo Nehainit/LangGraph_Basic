@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f6fb">
+  <title>Softframe — story Shorts from one line</title>
+  <meta name="description" content="Type one line of story. Get a narrated, subtitled Short with consistent characters, in Hindi or English, in about 10 minutes.">
+  <meta property="og:title" content="Softframe — story Shorts from one line">
+  <meta property="og:description" content="Narrated, subtitled story Shorts with consistent characters, in Hindi or English.">
+  <meta property="og:image" content="media/version-4-rabbit-turtle-poster.jpg">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%231c1f4a'/%3E%3Cpath d='M15 11v18l14-9z' fill='%23f0a23a'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mukta:wght@400;500;700&family=Tiro+Devanagari+Hindi:ital@0;1&display=swap">
+  <link rel="stylesheet" href="landing.css">
+  <script src="config.js"></script>
+  <script type="module" src="landing.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="Softframe home">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="10"/><path d="M15 11v18l14-9z"/></svg>
+      Softframe
+    </a>
+    <nav class="nav" aria-label="Page">
+      <a href="#films">Films</a>
+      <a href="#pricing">Pricing</a>
+      <a class="nav-cta" href="#waitlist">Join the waitlist</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero" aria-labelledby="heroTitle">
+      <div class="hero-copy">
+        <h1 id="heroTitle">Story Shorts from one line of text.</h1>
+        <p class="lede">Write the idea. Softframe writes the story, draws characters that stay the same in every shot, animates it, and adds narration and subtitles in Hindi or English.</p>
+
+        <figure class="prompt-card">
+          <figcaption>The prompt behind this film</figcaption>
+          <p class="prompt-text" id="promptText"><span class="typed"></span><span class="rest">A rabbit challenges a quiet turtle to a race through the forest. Slow and steady wins the day.</span></p>
+          <p class="prompt-meta">Illustrated style, portrait, ready in about 10 minutes.</p>
+        </figure>
+
+        <div class="hero-actions">
+          <a class="button" href="#waitlist">Join the waitlist</a>
+          <a class="text-link" href="#how">See how it works</a>
+        </div>
+        <p class="hindi-note" lang="hi">कहानी आपकी, आवाज़ हिंदी में।</p>
+      </div>
+
+      <div class="hero-film">
+        <video id="heroVideo" class="film" src="media/version-4-rabbit-turtle.mp4" poster="media/version-4-rabbit-turtle-poster.jpg" muted loop playsinline preload="metadata" aria-label="Rabbit and turtle race, a 17-second film made by Softframe"></video>
+        <button class="sound-toggle" type="button" id="soundToggle" aria-pressed="false">Turn sound on</button>
+      </div>
+    </section>
+
+    <section class="band" id="how" aria-labelledby="howTitle">
+      <div class="section-head">
+        <h2 id="howTitle">You approve every frame before anything moves.</h2>
+        <p>Animation is the slow part, so you see the whole storyboard first. Redraw any frame that looks off, then approve once and the film is cut for you.</p>
+      </div>
+      <img class="storyboard" src="media/storyboard.jpg" alt="Seven storyboard frames of the rabbit and turtle race, from the challenge to the turtle crossing the finish line" loading="lazy">
+
+      <ol class="steps">
+        <li>
+          <h3>Write one line</h3>
+          <p>Pick a style (illustrated, anime, cinematic or 3D), a language and a format: 9:16, 16:9 or 1:1.</p>
+        </li>
+        <li>
+          <h3>Approve the storyboard</h3>
+          <p>About 4 minutes later, every frame is ready with notes on anything that looks wrong. Redraw what you don’t like.</p>
+        </li>
+        <li>
+          <h3>Download the film</h3>
+          <p>About 6 minutes after approval: a narrated, subtitled 1080p MP4, plus every clip on its own.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section class="films" id="films" aria-labelledby="filmsTitle">
+      <div class="section-head">
+        <h2 id="filmsTitle">Films made with Softframe</h2>
+        <p>Unedited output. Tap a film to play it with sound.</p>
+      </div>
+      <div class="film-row">
+        <figure>
+          <video class="film" src="media/version-4-rabbit-turtle.mp4" poster="media/version-4-rabbit-turtle-poster.jpg" controls playsinline preload="none"></video>
+          <figcaption>The rabbit and the turtle<span>17 seconds, illustrated</span></figcaption>
+        </figure>
+        <figure>
+          <video class="film" src="media/version-3-ganesha.mp4" poster="media/version-3-ganesha-poster.jpg" controls playsinline preload="none"></video>
+          <figcaption>A Ganesha story<span>25 seconds, illustrated</span></figcaption>
+        </figure>
+        <figure>
+          <video class="film" src="media/version-2-raja-rani.mp4" poster="media/version-2-raja-rani-poster.jpg" controls playsinline preload="none"></video>
+          <figcaption>Raja and Rani walk their city<span>30 seconds, animated</span></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="band" id="pricing" aria-labelledby="pricingTitle">
+      <div class="section-head pricing-head">
+        <div>
+          <h2 id="pricingTitle">Launch pricing</h2>
+          <p>Every film is up to 30 seconds. Waitlist members keep these prices for their first 12 months.</p>
+        </div>
+        <div class="currency" role="group" aria-label="Currency">
+          <button type="button" data-currency="INR" aria-pressed="true">₹ INR</button>
+          <button type="button" data-currency="USD" aria-pressed="false">$ USD</button>
+        </div>
+      </div>
+
+      <div class="plans">
+        <article class="plan">
+          <h3>Single film</h3>
+          <p class="price"><span data-inr="₹599" data-usd="$7">₹599</span></p>
+          <p class="plan-for">Try it on one story. No subscription.</p>
+          <ul>
+            <li>1 film</li>
+            <li>Hindi or English narration</li>
+            <li>Subtitles and 1080p download</li>
+          </ul>
+          <a class="button button-quiet" href="#waitlist" data-plan="pack">Choose single film</a>
+        </article>
+        <article class="plan plan-featured">
+          <h3>Starter</h3>
+          <p class="price"><span data-inr="₹1,499" data-usd="$19">₹1,499</span><small>/month</small></p>
+          <p class="plan-for">For a channel posting once a week.</p>
+          <ul>
+            <li>4 films a month</li>
+            <li>All styles and formats</li>
+            <li>Extra films at the single-film price</li>
+          </ul>
+          <a class="button" href="#waitlist" data-plan="starter">Choose Starter</a>
+        </article>
+        <article class="plan">
+          <h3>Creator</h3>
+          <p class="price"><span data-inr="₹3,999" data-usd="$49">₹3,999</span><small>/month</small></p>
+          <p class="plan-for">For channels posting two or three times a week.</p>
+          <ul>
+            <li>10 films a month</li>
+            <li>Your films render first</li>
+            <li>Reuse characters across films</li>
+          </ul>
+          <a class="button button-quiet" href="#waitlist" data-plan="creator">Choose Creator</a>
+        </article>
+      </div>
+      <p class="fine-print" id="taxNote">Indian prices exclude GST.</p>
+    </section>
+
+    <section class="waitlist" id="waitlist" aria-labelledby="waitlistTitle">
+      <div class="section-head">
+        <h2 id="waitlistTitle">Join the waitlist</h2>
+        <p>We’re opening access in small batches. Tell us about your channel and you’ll hear from us when your spot opens.</p>
+      </div>
+
+      <form class="waitlist-form" id="waitlistForm" novalidate>
+        <label class="field">
+          <span>Email</span>
+          <input type="email" name="email" autocomplete="email" required maxlength="254" placeholder="you@example.com">
+        </label>
+        <label class="field">
+          <span>Channel link <em>(optional)</em></span>
+          <input type="url" name="channel_url" maxlength="300" placeholder="youtube.com/@yourchannel">
+        </label>
+
+        <fieldset class="field">
+          <legend>Narration language</legend>
+          <div class="options">
+            <label><input type="radio" name="language" value="hindi" checked> Hindi</label>
+            <label><input type="radio" name="language" value="english"> English</label>
+            <label><input type="radio" name="language" value="both"> Both</label>
+            <label><input type="radio" name="language" value="other"> Another language</label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>Films you’d make each month</legend>
+          <div class="options">
+            <label><input type="radio" name="films_per_month" value="1-4" checked> 1–4</label>
+            <label><input type="radio" name="films_per_month" value="5-15"> 5–15</label>
+            <label><input type="radio" name="films_per_month" value="16+"> 16 or more</label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>Plan you’d pick</legend>
+          <div class="options">
+            <label><input type="radio" name="plan" value="pack"> Single film</label>
+            <label><input type="radio" name="plan" value="starter" checked> Starter</label>
+            <label><input type="radio" name="plan" value="creator"> Creator</label>
+            <label><input type="radio" name="plan" value="unsure"> Not sure yet</label>
+          </div>
+        </fieldset>
+
+        <label class="trap" aria-hidden="true">Company <input type="text" name="company" tabindex="-1" autocomplete="off"></label>
+
+        <button class="button" type="submit" id="joinButton">Join the waitlist</button>
+        <p class="form-status" id="formStatus" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <section class="faq" aria-labelledby="faqTitle">
+      <h2 id="faqTitle">Questions</h2>
+      <details>
+        <summary>Will my characters look the same in every shot?</summary>
+        <p>Yes. Softframe draws a character sheet for each character first and uses it as the reference for every frame. That’s how the rabbit stays the same rabbit for the whole race.</p>
+      </details>
+      <details>
+        <summary>Which languages can it narrate in?</summary>
+        <p>Hindi and English today. Subtitles follow the narration. If you need another language, pick “Another language” on the waitlist so we know.</p>
+      </details>
+      <details>
+        <summary>Can I fix a frame I don’t like?</summary>
+        <p>Yes. You review the full storyboard before anything is animated and can redraw individual frames. Once you approve it, the film is made from exactly those frames.</p>
+      </details>
+      <details>
+        <summary>How long can a film be?</summary>
+        <p>Up to 30 seconds per film today, which fits YouTube Shorts and Instagram Reels. Longer films are on the roadmap.</p>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>© <span id="year">2026</span> Softframe</p>
+  </footer>
+</body>
+</html>

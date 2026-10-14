@@ -277,7 +277,11 @@ class AgentState(TypedDict):
     visual_style: NotRequired[str]
     duration: str
     language: str
+    # Ask the viewer to comment and like in the closing line (reels narration formula).
+    call_to_action: NotRequired[bool]
     characters: str | list[str]
+    # Saved characters the user @-mentioned: name, description, and approved sheet file.
+    library_characters: NotRequired[list[dict[str, Any]]]
     genre: NotRequired[str]
     genre_structure: NotRequired[list[str]]
     output_dir: NotRequired[str]
@@ -407,6 +411,9 @@ class AgentState(TypedDict):
     narration_alignment_file: NotRequired[str]
     narration_alignment: NotRequired[dict[str, Any]]
     narration_segment_timings: NotRequired[list[dict[str, float | int | str]]]
+    # Timed effects from the free sound library: file, start_seconds, volume.
+    sound_cues: NotRequired[list[dict[str, Any]]]
+    music_id: NotRequired[str]
     actual_narration_seconds: NotRequired[float]
     narration_feedback: NotRequired[str]
     narration_target_words: NotRequired[int]

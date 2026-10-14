@@ -1282,3 +1282,225 @@ def test_copied_prompt_placeholders_are_replaced_from_the_approved_beat():
         preproduction_agents._apply_shot_grammar(
             [{**shot, "composition": "Concrete placement of subjects and relevant environment."}], {"vb-001": beat},
         )
+
+
+REELS_STORY = {
+    "idea": "Strawberry is caught between two loves.",
+    "structure": [
+        {"beat_id": "beat-001", "description": 'Kela tells Mango, "Strawberry was with someone at the pool."'},
+        {"beat_id": "beat-002", "description": 'Mango asks Strawberry, "Who was she?"'},
+        {"beat_id": "beat-003", "description": 'A Pineapple girl arrives and says, "Hi Strawberry... did you miss me?"'},
+    ],
+}
+
+
+def _reels_response(**overrides):
+    response = {
+        "cold_open": {"text": "Suddenly, a Pineapple girl walked through the villa gate.", "source_beat_number": 3},
+        "hook": "Who is the girl at the gate?",
+        "narration_segments": [
+            {"text": "Once, Kela leaned close to Mango.\nHe told her that Strawberry was with someone at the pool."},
+            {"text": "Mango marched to Strawberry.\nShe asked him who she was."},
+            {"text": "Then the gate opened.\nThe Pineapple girl smiled and greeted Strawberry."},
+        ],
+        "moral": "And everyone waited for his answer...",
+        "call_to_action": "Comment Part 2 and like the video.",
+        "needs_story_revision": False,
+        "revision_reason": None,
+    }
+    response.update(overrides)
+    return response
+
+
+def _scripted_model(responses, prompts):
+    class ScriptedModel:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return type("Response", (), {"content": json.dumps(next(responses), ensure_ascii=False)})()
+
+    return ScriptedModel()
+
+
+@pytest.fixture
+def reels_formula(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["planning"], "narration_semantic_review", False)
+    narration = preproduction_agents.PIPELINE_CONFIG["narration"]
+    monkeypatch.setitem(narration, "formula", "reels")
+    monkeypatch.setitem(narration, "formula_min_seconds", 20)
+    # These stories contain dialogue; the narrator formula is what is under test here.
+    monkeypatch.setitem(narration, "dialogue_only", False)
+
+
+def _reels_state(**extra):
+    return {
+        "duration": "30 seconds", "language": "English", "story_outline": REELS_STORY,
+        "parsed_requirements": {"duration_seconds": 30, "language": "English"},
+        # A measured-timing word cap replaces the length range, so short fixtures stay valid.
+        "narration_target_words": 200,
+        **extra,
+    }
+
+
+def test_reels_narration_plays_cold_open_story_then_closing(monkeypatch, reels_formula):
+    response = _reels_response()
+    response.pop("hook")
+    response.pop("call_to_action")
+    prompts = []
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: _scripted_model(iter([response]), prompts))
+
+    result = preproduction_agents.create_narration_script(_reels_state())
+
+    segments = result["narration_segments"]
+    assert [segment["role"] for segment in segments] == ["cold_open", "story", "story", "story", "closing"]
+    assert segments[0]["parent_beat_ids"] == ["beat-003"]
+    assert segments[-1]["text"] == "And everyone waited for his answer..."
+    # One narrator: the prompt asks for reported speech and offers no question hook or call to action by default.
+    assert "Retell what the characters say in reported speech" in prompts[0][1]["content"]
+    assert "hook" not in json.loads(prompts[0][1]["content"].split("schema:\n", 1)[1].split("\nWhen needs_story_revision", 1)[0])
+
+
+def test_reels_narration_adds_hook_and_call_to_action_when_turned_on(monkeypatch, reels_formula):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["narration"], "hook_question", True)
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: _scripted_model(iter([_reels_response()]), []))
+
+    result = preproduction_agents.create_narration_script(_reels_state(call_to_action=True))
+
+    segments = result["narration_segments"]
+    assert [segment["role"] for segment in segments] == ["cold_open", "hook", "story", "story", "story", "closing"]
+    assert segments[1]["parent_beat_ids"] == ["beat-001", "beat-002", "beat-003"]
+    assert segments[-1]["text"] == "And everyone waited for his answer...\nComment Part 2 and like the video."
+
+
+def test_narration_reports_every_problem_in_one_retry(monkeypatch, reels_formula):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["narration"], "hook_question", True)
+    quoted = _reels_response(
+        hook="Nobody knew who she was.",
+        moral=" ".join(["Everyone waited for his answer."] * 10),
+        narration_segments=[
+            {"text": 'Kela said, "Strawberry was with someone at the pool."'},
+            {"text": "Mango asked him who she was."},
+            {"text": "The Pineapple girl smiled and greeted Strawberry."},
+        ],
+    )
+    prompts = []
+    monkeypatch.setattr(
+        preproduction_agents, "load_model",
+        lambda _name: _scripted_model(iter([quoted, _reels_response()]), prompts),
+    )
+
+    result = preproduction_agents.create_narration_script(_reels_state(narration_target_words=70))
+
+    retry = prompts[1][1]["content"]
+    assert "use at most 70 words" in retry
+    assert "segment-003 quotes dialogue" in retry
+    assert "hook must ask the viewer a question" in retry
+    assert result["narration_segments"][1]["text"] == "Who is the girl at the gate?"
+
+
+def test_narration_fallback_keeps_the_draft_with_fewest_problems(monkeypatch, reels_formula):
+    clean = _reels_response()
+    quoted = _reels_response(
+        narration_segments=[{"text": '"Pool," Kela said.'}, {"text": '"Who?" Mango asked.'}, {"text": '"Hi," she said.'}],
+    )
+    monkeypatch.setattr(
+        preproduction_agents, "load_model",
+        lambda _name: _scripted_model(iter([quoted, clean, quoted]), []),
+    )
+
+    # A 20-word cap that every draft exceeds forces the fallback.
+    result = preproduction_agents.create_narration_script(_reels_state(narration_target_words=20))
+
+    assert result["narration_segments"][1]["text"] == "Once, Kela leaned close to Mango.\nHe told her that Strawberry was with someone at the pool."
+    assert "Narration review warning" in result["warnings"][-1]
+
+
+def test_hindi_narration_rejects_latin_names_first_person_and_quotes():
+    segments = [
+        {"segment_id": "segment-001", "role": "story", "text": "Kela Bhai ने मैंगो को बताया।"},
+        {"segment_id": "segment-002", "role": "story", "text": "मैंने अपना रूप बदला था।"},
+        {"segment_id": "segment-003", "role": "story", "text": 'अर्जुन बोला, "मैं आऊँगा।"'},
+        {"segment_id": "segment-004", "role": "story", "text": "अर्जुन ने कहा कि वो आएगा।"},
+    ]
+
+    issues = preproduction_agents._spoken_style_issues(segments, hindi=True, story_has_dialogue=True)
+
+    assert any("segment-001 has Latin letters" in issue for issue in issues)
+    assert any("segment-002 narrates in first person" in issue for issue in issues)
+    assert any("segment-003 quotes dialogue" in issue for issue in issues)
+    assert not any("segment-004" in issue for issue in issues)
+
+
+def test_spoken_lines_must_end_with_punctuation():
+    segments = [{"segment_id": "segment-001", "role": "story", "text": "मैंगो ने पूछा कौन है वह\nस्ट्रॉबेरी हकलाया।"}]
+
+    issues = preproduction_agents._spoken_style_issues(segments, hindi=True, story_has_dialogue=False)
+
+    assert issues == ['segment-001 has lines without ending punctuation (। . ? !): "मैंगो ने पूछा कौन है वह".']
+
+
+FRUIT_STORY = {
+    "idea": "A villa drama.",
+    "structure": [
+        {"beat_id": "beat-001", "description": 'Kela Bhai whispers to Mango Rani, "Did you see who Strawberry was with?" The mood is tense.'},
+        {"beat_id": "beat-002", "description": 'Mango Rani asks, "Who was she?" Strawberry Raja stammers, "Mango, I can explain..."'},
+        {"beat_id": "beat-003", "description": "Everyone freezes as the gate opens."},
+    ],
+}
+FRUIT_CAST = {"characters": [
+    {"character_id": "character-001", "name": "Mango Rani", "description": "A glamorous mango girl."},
+    {"character_id": "character-002", "name": "Strawberry Raja", "description": "A charming strawberry boy."},
+    {"character_id": "character-003", "name": "Kela Bhai", "description": "A cheeky banana boy."},
+]}
+
+
+def test_dialogue_story_speaks_only_its_quoted_lines_in_character(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["narration"], "dialogue_only", True)
+    latin = {"lines": [
+        {"beat_number": 1, "speaker": "Kela Bhai", "gender": "male", "text": "Strawberry kiske saath tha?"},
+        {"beat_number": 2, "speaker": "Mango Rani", "gender": "female", "text": "वह कौन थी?"},
+        {"beat_number": 2, "speaker": "Strawberry Raja", "gender": "male", "text": "मैंगो, मैं समझा सकता हूँ..."},
+    ]}
+    fixed = {"lines": [{**latin["lines"][0], "text": "क्या तुमने देखा, स्ट्रॉबेरी किसके साथ था?"}, *latin["lines"][1:]]}
+    prompts = []
+    monkeypatch.setattr(preproduction_agents, "load_model", lambda _name: _scripted_model(iter([latin, fixed]), prompts))
+    monkeypatch.setattr(preproduction_agents, "_context", lambda _state: FRUIT_CAST)
+
+    result = preproduction_agents.create_narration_script({
+        "duration": "30 seconds", "language": "Hindi", "story_outline": FRUIT_STORY,
+        "parsed_requirements": {"duration_seconds": 30, "language": "Hindi"},
+    })
+
+    segments = result["narration_segments"]
+    # beat-003 has no dialogue, so it plays in the pause after the last line.
+    assert [(s["speaker_id"], s["voice_gender"], s["parent_beat_ids"]) for s in segments] == [
+        ("character-003", "male", ["beat-001"]),
+        ("character-001", "female", ["beat-002"]),
+        ("character-002", "male", ["beat-002", "beat-003"]),
+    ]
+    # Stage directions ("The mood is tense", "Everyone freezes") are never spoken.
+    assert "tense" not in result["narration_script"] and "freezes" not in result["narration_script"]
+    assert "Line 1 must be spoken Hindi in Devanagari" in prompts[1][1]["content"]
+    assert [item["purpose"] for item in result["llm_evaluations"]] == ["generate_dialogue_script"] * 2
+
+
+def test_dialogue_script_rejects_unknown_speakers_and_missing_lines():
+    expected = preproduction_agents._story_dialogue(FRUIT_STORY)
+    cast = preproduction_agents._cast(FRUIT_CAST)
+
+    assert len(expected) == 3
+    assert preproduction_agents._dialogue_problems({"lines": []}, expected, cast, hindi=False) == [
+        "Return exactly 3 lines, one per quoted line, in order; received 0."
+    ]
+    lines = [
+        {"beat_number": 1, "speaker": "Narrator", "gender": "male", "text": "Did you see?"},
+        {"beat_number": 2, "speaker": "Mango Rani", "gender": "female", "text": "Who was she?"},
+        {"beat_number": 2, "speaker": "Mango Rani", "gender": "male", "text": "I can explain."},
+    ]
+    problems = preproduction_agents._dialogue_problems({"lines": lines}, expected, cast, hindi=False)
+    assert any('speaker "Narrator" must be one of' in problem for problem in problems)
+    assert "Mango Rani must keep one gender on every line." in problems
+
+
+def test_story_without_dialogue_keeps_the_narrator(monkeypatch):
+    monkeypatch.setitem(preproduction_agents.PIPELINE_CONFIG["narration"], "dialogue_only", True)
+    assert preproduction_agents._dialogue_narration({}, {"structure": [{"beat_id": "beat-001", "description": "A turtle walks."}]}, "English", False) is None

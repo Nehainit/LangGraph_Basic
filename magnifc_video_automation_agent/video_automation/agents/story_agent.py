@@ -2,6 +2,7 @@ import json
 import re
 from copy import deepcopy
 
+from video_automation.continuity_context import library_character_for
 from video_automation.models import invoke_with_evaluation, load_model
 from video_automation.prompts import CONTENT_SAFETY_SYSTEM_PROMPT, SAFETY_CATEGORIES, story_prompt
 from video_automation.schema import AgentState, validate_story_outline, validate_story_requirements
@@ -177,6 +178,11 @@ def create_story(user_input: str | dict) -> dict:
 def create_story_node(state: AgentState) -> dict:
     """Adapt the story-only contract to the existing video workflow's prose input."""
     result = create_story(state)
+    for character in result["story"]["characters"]:
+        # A saved character keeps the description its approved sheet was drawn from, not the story model's rewording.
+        saved = library_character_for(character["name"], state)
+        if saved:
+            character["description"] = saved["description"]
     beats = result["story"]["structure"]
     return {
         "story": " ".join(beat["description"] for beat in beats),

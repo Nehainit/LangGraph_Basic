@@ -1,3 +1,7 @@
+import { authHeaders, goToSignIn, loadClerk } from './auth.js';
+import { mentionedCharacters, setupMentions } from './mentions.js';
+import { setupWriter } from './writer.js';
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
@@ -67,6 +71,8 @@ const toastEl = $('#toast');
 let catalog = [];
 let run = null; // { thread_id, request, status, response, artifacts }
 let shotNotes = new Map(); // shot_id -> note for the storyboard under review
+let tierChoices = new Map(); // shot_id -> video tier the reviewer picked, when it differs from the plan
+const TIER_LABELS = { static: 'Still motion (free)', standard: 'Animated', premium: 'Animated, premium model' };
 
 // ---------- Helpers ----------
 function el(tag, props = {}, ...children) {
@@ -110,9 +116,14 @@ function errorText(data, fallback) {
 async function post(url, body) {
   let response;
   try {
-    response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(await authHeaders()) }, body: JSON.stringify(body) });
   } catch {
     throw new Error('Could not reach the server. Is the backend running?');
+  }
+  if (response.status === 401) {
+    // The draft is already in this browser, so signing in again loses nothing.
+    goToSignIn();
+    throw new Error('Your session has expired. Sign in again to continue.');
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(errorText(data, `The server returned an error (${response.status}).`));
@@ -130,12 +141,14 @@ function issueText(issue) {
 function showView(name) {
   $('#createView').hidden = name !== 'create';
   $('#filmsView').hidden = name !== 'films';
+  $('#writerView').hidden = name !== 'writer';
   $$('.tab').forEach(tab => {
     const active = tab.dataset.view === name;
     tab.classList.toggle('is-active', active);
     if (active) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
   });
   if (name === 'films') renderFilms();
+  if (name === 'writer') { writer?.render(); $('#chatInput').focus(); }
 }
 
 // ---------- Compose form ----------
@@ -150,6 +163,7 @@ function formValues() {
     video_quality: data.get('video_quality'),
     quality_mode: data.get('quality_mode'),
     image_provider: data.get('image_provider'),
+    character_ids: mentionedCharacters(topic.value).map(character => character.id),
   };
   [['narration_model', narrationModel], ['image_model', imageModel], ['video_model', videoModel]].forEach(([key, select]) => {
     if (select.value) values[key] = select.value;
@@ -211,7 +225,7 @@ function saveDraft() {
 
 async function loadCatalog() {
   try {
-    const response = await fetch('/api/model-catalog');
+    const response = await fetch('/api/model-catalog', { headers: await authHeaders() });
     if (!response.ok) throw new Error();
     const data = await response.json();
     catalog = data.models || [];
@@ -344,7 +358,7 @@ function carousel(items, { ratio, label, hint, card, caption, onChange }) {
     counter.textContent = `${pad(index + 1)} / ${pad(items.length)}`;
     prev.disabled = index === 0;
     next.disabled = index === items.length - 1;
-    captionBox.replaceChildren(...caption(items[index], index));
+    captionBox.replaceChildren(...caption(items[index], index).filter(child => child != null));
     onChange?.(index, cards);
   }
 
@@ -391,11 +405,43 @@ function shotTime(shot) {
   return `${format(shot.start_time)} – ${format(shot.end_time)}`;
 }
 
-function storyboardCarousel(shots, images, qaResults) {
+// Each shot's animation tier and its estimated price; the reviewer can change any shot before animating.
+function tierPicker(item, index) {
+  const plan = item.plan;
+  if (!plan?.video_tier) return null;
+  const select = el('select', { class: 'cf-tier-select', 'aria-label': `Animation for shot ${index + 1}` },
+    ...Object.entries(TIER_LABELS).map(([value, label]) => el('option', { value, text: label })));
+  select.value = tierChoices.get(item.id) || plan.video_tier;
+  select.addEventListener('change', () => {
+    if (select.value === plan.video_tier) tierChoices.delete(item.id); else tierChoices.set(item.id, select.value);
+    $$('.cf-card .cf-still', $('#reviewBody'))[index].hidden = select.value !== 'static';
+    syncVideoEstimate();
+  });
+  const price = plan.video_tier === 'static' ? 'free' : plan.estimated_usd != null ? `about $${plan.estimated_usd.toFixed(2)}` : '';
+  return el('label', { class: 'cf-tier' },
+    el('span', { text: 'Video: ' }), select,
+    el('small', { text: [plan.tier_reason, tierChoices.has(item.id) ? '' : price].filter(Boolean).join(' · ') }));
+}
+
+function syncVideoEstimate() {
+  const box = $('#videoEstimate');
+  const plans = run?.artifacts?.motion_plans || [];
+  if (!box || !plans.length) return;
+  // A changed shot's new price is set when the film is approved, so it is counted separately.
+  const changed = plans.filter(plan => tierChoices.has(plan.shot_id)).length;
+  const total = plans.reduce((sum, plan) => sum + (tierChoices.has(plan.shot_id) ? 0 : (plan.estimated_usd || 0)), 0);
+  const still = plans.filter(plan => (tierChoices.get(plan.shot_id) || plan.video_tier) === 'static').length;
+  box.textContent = `Animating costs about $${total.toFixed(2)}`
+    + (changed ? ` plus ${changed} changed shot${changed === 1 ? '' : 's'}` : '')
+    + (still ? ` · ${still} shot${still === 1 ? '' : 's'} use${still === 1 ? 's' : ''} still motion` : '');
+}
+
+function storyboardCarousel(shots, images, qaResults, plans = []) {
   const qaById = new Map(qaResults.map(result => [result.shot_id, result]));
+  const planById = new Map(plans.map(plan => [plan.shot_id, plan]));
   const items = shots.map((shot, index) => {
     const id = shot.shot_id || `shot-${pad(index + 1)}`;
-    return { shot, image: images[index], id, findings: qaFindings(qaById.get(id)) };
+    return { shot, image: images[index], id, findings: qaFindings(qaById.get(id)), plan: planById.get(id) };
   });
   return carousel(items, {
     ratio: run.request.aspect_ratio,
@@ -405,8 +451,9 @@ function storyboardCarousel(shots, images, qaResults) {
       item.image ? el('img', { src: item.image, alt: `Frame for shot ${index + 1}`, draggable: 'false' }) : el('span', { class: 'cf-empty', text: 'No frame' }),
       el('span', { class: 'cf-tag', text: `Shot ${pad(index + 1)}` }),
       item.shot.start_time != null ? el('span', { class: 'cf-time', text: shotTime(item.shot) }) : null,
-      el('span', { class: 'cf-pill', text: 'Note', hidden: !shotNotes.get(item.id) }),
+      el('span', { class: 'cf-pill cf-note-pill', text: 'Note', hidden: !shotNotes.get(item.id) }),
       item.findings.length ? el('span', { class: 'cf-pill cf-warn', text: 'Check' }) : null,
+      el('span', { class: 'cf-pill cf-still', text: 'Still motion', hidden: (tierChoices.get(item.id) || item.plan?.video_tier) !== 'static' }),
       el('span', { class: 'cf-pending', text: 'Animating…' }),
     ],
     caption: (item, index) => {
@@ -414,13 +461,14 @@ function storyboardCarousel(shots, images, qaResults) {
       note.value = shotNotes.get(item.id) || '';
       note.addEventListener('input', () => {
         if (note.value.trim()) shotNotes.set(item.id, note.value); else shotNotes.delete(item.id);
-        $$('.cf-card .cf-pill', $('#reviewBody'))[index].hidden = !shotNotes.has(item.id);
+        $$('.cf-card .cf-note-pill', $('#reviewBody'))[index].hidden = !shotNotes.has(item.id);
         syncRedoButton();
       });
       const findings = item.findings.length
         ? el('ul', { class: 'cf-qa', 'aria-label': 'Automatic check' }, ...item.findings.map(text => el('li', { text })))
         : null;
-      return [...shotCaption(item.shot, index), findings, $('#renderingBar').hidden ? note : null];
+      const editable = $('#renderingBar').hidden;
+      return [...shotCaption(item.shot, index), findings, editable ? tierPicker(item, index) : null, editable ? note : null];
     },
   });
 }
@@ -437,7 +485,11 @@ function clipCarousel(clips, storyboard) {
         if (!video.closest('.is-active')) return;
         if (video.paused) video.play().catch(() => {}); else video.pause();
       });
-      return [video, el('span', { class: 'cf-tag', text: `Shot ${pad((shots.get(clip.shot_id)?.index ?? index) + 1)}` })];
+      return [
+        video,
+        el('span', { class: 'cf-tag', text: `Shot ${pad((shots.get(clip.shot_id)?.index ?? index) + 1)}` }),
+        clip.provider === 'ffmpeg' ? el('span', { class: 'cf-pill cf-still', text: clip.reason === 'planned_static' ? 'Still motion' : 'Still motion (fallback)' }) : null,
+      ];
     },
     caption: (clip, index) => {
       const match = shots.get(clip.shot_id);
@@ -519,7 +571,9 @@ function renderReview(data) {
     content = el('div', {},
       el('div', { class: 'boards' },
         el('figure', {}, el('img', { src: data.character_board_url || artifacts.character_board_url, alt: 'Character board' }), el('figcaption', { text: 'Characters' })),
-        el('figure', {}, el('img', { src: data.mood_board_url || artifacts.mood_board_url, alt: 'Mood board' }), el('figcaption', { text: 'Mood' })),
+        (data.mood_board_url || artifacts.mood_board_url)
+          ? el('figure', {}, el('img', { src: data.mood_board_url || artifacts.mood_board_url, alt: 'Mood board' }), el('figcaption', { text: 'Mood' }))
+          : null,
       ),
       renderBible(data.production_bible || artifacts.production_bible),
     );
@@ -528,8 +582,13 @@ function renderReview(data) {
     content = el('div', { class: 'shots' }, ...shots.map((shot, index) => shotCard(shot, index, { editable: true })));
   } else if (data.status === 'visual_storyboard_review') {
     shotNotes = new Map();
+    tierChoices = new Map();
     const qaResults = data.shot_image_qa_results || artifacts.shot_image_qa_results || [];
-    content = storyboardCarousel(data.storyboard || artifacts.storyboard || [], data.image_urls || artifacts.image_urls || [], qaResults);
+    const plans = artifacts.motion_plans || [];
+    content = el('div', {},
+      storyboardCarousel(data.storyboard || artifacts.storyboard || [], data.image_urls || artifacts.image_urls || [], qaResults, plans),
+      plans.length ? el('p', { class: 'video-estimate', id: 'videoEstimate' }) : null,
+    );
     const flagged = qaResults.filter(result => qaFindings(result).length).length;
     if (flagged && !reason.textContent) {
       reason.textContent = `Our automatic check flagged ${flagged} shot${flagged === 1 ? '' : 's'} marked “Check”. Take a closer look, then animate or leave a note to redraw.`;
@@ -537,6 +596,7 @@ function renderReview(data) {
     }
   }
   $('#reviewBody').replaceChildren(...(content ? [content] : []));
+  syncVideoEstimate();
 
   $('#noteField').hidden = !config.note;
   $('#noteHint').textContent = data.status.endsWith('_plan_review') ? '(optional)' : '(needed if you ask for a new version)';
@@ -596,6 +656,9 @@ async function submitReview(action) {
     if (!body.feedback.length) return fail('Add a note to at least one shot you want redone.');
   } else if (config.note && note && status.endsWith('_plan_review')) {
     body.note = note;
+  }
+  if (status === 'visual_storyboard_review' && action === 'approve' && tierChoices.size) {
+    body.video_tiers = Object.fromEntries(tierChoices);
   }
 
   errorBox.hidden = true;
@@ -690,6 +753,31 @@ dialog.addEventListener('click', event => {
 });
 
 // ---------- Events ----------
+const mentions = setupMentions({
+  form,
+  textarea: topic,
+  menu: $('#mentionMenu'),
+  cast: $('#castRow'),
+  styleOf: () => new FormData(form).get('visual_style'),
+  useStyle: style => { setRadio('visual_style', style); form.dispatchEvent(new Event('change')); },
+});
+const writer = setupWriter({
+  post,
+  toast,
+  settings: () => ({ duration: Number(duration.value), language: language.value, style: new FormData(form).get('visual_style') || 'illustrated' }),
+  onUse: story => {
+    topic.value = story.slice(0, Number(topic.maxLength));
+    // Bubbling from the textarea also refreshes the @ cast row and saves the draft.
+    topic.dispatchEvent(new Event('input', { bubbles: true }));
+    showView('create');
+    if (!form.hidden) {
+      topic.focus();
+      toast('Your story is in the prompt. Pick a style and make your film.');
+    } else {
+      toast('Saved to your story box. It will be there when you start your next film.');
+    }
+  },
+});
 form.addEventListener('submit', startFilm);
 form.addEventListener('input', () => { syncForm(); saveDraft(); topicError.hidden = true; });
 form.addEventListener('change', () => { syncForm(); saveDraft(); });
@@ -752,10 +840,20 @@ window.addEventListener('beforeunload', event => {
 
 // ---------- Boot ----------
 (async function boot() {
+  // Open the linked view before sign-in and the model list load, so clicks never land on the wrong view.
+  const linked = { '#films': 'films', '#writer': 'writer' }[location.hash];
+  if (linked) showView(linked);
+  const { clerk } = await loadClerk().catch(() => ({ clerk: null }));
+  if (clerk && !clerk.isSignedIn) {
+    goToSignIn();
+    return;
+  }
+  if (clerk) clerk.mountUserButton($('#userButton'));
   await loadCatalog();
   // Every session starts on fal.ai (Magnific is only the backend fallback), so the platform is not restored.
   const { image_provider: _provider, image_model: _image, video_model: _video, ...draft } = store.get(KEYS.draft, {});
   applyValues(draft);
+  mentions.renderCast();
 
   const saved = store.get(KEYS.run, null);
   if (saved?.status && REVIEWS[saved.status] && saved.response) {

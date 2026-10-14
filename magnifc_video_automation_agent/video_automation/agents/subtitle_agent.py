@@ -70,36 +70,57 @@ def _scene_number(seconds: float, scene_timings: list[dict]) -> int:
     return int(scene_timings[-1]["scene_number"]) if scene_timings else 1
 
 
+SENTENCE_ENDS = (".", "!", "?", "\u2026", "\u0964")  # includes the Hindi full stop (danda)
+MAX_CAPTION_WORDS = 6
+MAX_CAPTION_SECONDS = 2.8
+# A silence this long between two words is a new spoken line, even without punctuation.
+CAPTION_PAUSE_SECONDS = 0.5
+
+
+def _spoken_sentences(words: list[dict]) -> list[list[dict]]:
+    sentences, current = [], []
+    for word in words:
+        if current and float(word["start_seconds"]) - float(current[-1]["end_seconds"]) >= CAPTION_PAUSE_SECONDS:
+            sentences.append(current)
+            current = []
+        current.append(word)
+        if str(word["text"]).rstrip('"\u201d\u2019\'').endswith(SENTENCE_ENDS):
+            sentences.append(current)
+            current = []
+    if current:
+        sentences.append(current)
+    return sentences
+
+
+def _caption_chunks(sentence: list[dict]) -> list[list[dict]]:
+    """Split one sentence into evenly sized captions, so no caption is a stray last word."""
+    seconds = float(sentence[-1]["end_seconds"]) - float(sentence[0]["start_seconds"])
+    count = max(-(-len(sentence) // MAX_CAPTION_WORDS), int(seconds // MAX_CAPTION_SECONDS) + (seconds % MAX_CAPTION_SECONDS > 0.5))
+    count = max(1, min(count, (len(sentence) + 1) // 2))  # every caption keeps at least two words
+    size, extra = divmod(len(sentence), count)
+    chunks, offset = [], 0
+    for index in range(count):
+        width = size + (1 if index < extra else 0)
+        chunks.append(sentence[offset:offset + width])
+        offset += width
+    return chunks
+
+
 def _word_subtitles(alignment_file: str) -> list[dict[str, object]]:
     data = json.loads(Path(alignment_file).read_text(encoding="utf-8"))
     words = _words_from_alignment(data["alignment"])
     scene_timings = data.get("scene_timings", [])
-    subtitles = []
-    group = []
-
-    for word in words:
-        group.append(word)
-        if len(group) == 6 or float(group[-1]["end_seconds"]) - float(group[0]["start_seconds"]) >= 2.5:
-            subtitles.append(
-                {
-                    "scene_number": _scene_number(float(group[0]["start_seconds"]), scene_timings),
-                    "start_seconds": float(group[0]["start_seconds"]),
-                    "end_seconds": float(group[-1]["end_seconds"]),
-                    "text": " ".join(str(item["text"]) for item in group),
-                }
-            )
-            group = []
-
-    if group:
-        subtitles.append(
-            {
-                "scene_number": _scene_number(float(group[0]["start_seconds"]), scene_timings),
-                "start_seconds": float(group[0]["start_seconds"]),
-                "end_seconds": float(group[-1]["end_seconds"]),
-                "text": " ".join(str(item["text"]) for item in group),
-            }
-        )
-    return subtitles
+    # A caption never runs past its sentence or a pause, so it never straddles two spoken lines or a cut.
+    return [
+        {
+            "scene_number": _scene_number(float(group[0]["start_seconds"]), scene_timings),
+            "start_seconds": float(group[0]["start_seconds"]),
+            "end_seconds": float(group[-1]["end_seconds"]),
+            "text": " ".join(str(item["text"]) for item in group),
+        }
+        for sentence in _spoken_sentences(words)
+        for group in _caption_chunks(sentence)
+    ]
 
 
 def create_subtitles(state: AgentState) -> dict[str, object]:
