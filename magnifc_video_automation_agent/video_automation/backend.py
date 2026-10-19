@@ -27,7 +27,9 @@ from video_automation.agents.video_validator import validate_generated_videos
 from video_automation.artifact_store import archive_artifacts
 from video_automation.cost_control import spend_summary
 from video_automation.auth import public_auth_config, require_user
+from video_automation.billing import film_seconds, hold_film, release_film, require_film_allowance, router as billing_router, settle_film
 from video_automation.character_library import film_characters, router as character_router, saved_character_names
+from video_automation.drafts import find_draft, forget_film, record_film, router as drafts_router
 
 
 class VideoRequest(BaseModel):
@@ -44,6 +46,8 @@ class VideoRequest(BaseModel):
     narration_model: str | None = None
     image_model: str | None = None
     video_model: str | None = None
+    # The My films story draft this film was made from; the film replaces it there.
+    draft_id: str | None = None
 
     @field_validator("narration_model", "image_model", "video_model")
     @classmethod
@@ -115,6 +119,8 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory=FRONTEND), name="frontend")
 app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
 app.include_router(character_router)
+app.include_router(drafts_router)
+app.include_router(billing_router)
 logger = logging.getLogger(__name__)
 graph = build_story_graph(
     # Deployments point CHECKPOINT_DB into a mounted volume so paused films survive restarts.
@@ -293,7 +299,9 @@ def _artifacts(result: dict) -> dict:
     }
 
 
-def _graph_response(result: dict, thread_id: str) -> dict:
+def _graph_response(result: dict, thread_id: str, archive: bool = True) -> dict:
+    """`archive=False` rebuilds a paused review without writing another artifact snapshot."""
+    _archive_stage = _archive if archive else (lambda *_args: None)
     artifacts = _artifacts(result)
     if "__interrupt__" in result:
         review = result["__interrupt__"][0].value
@@ -334,7 +342,7 @@ def _graph_response(result: dict, thread_id: str) -> dict:
                     "image_urls": [_output_url(path) for path in review["image_files"]],
                 }
             )
-            artifacts["storage"] = _archive({**result, **artifacts}, thread_id, "visual-storyboard-review")
+            artifacts["storage"] = _archive_stage({**result, **artifacts}, thread_id, "visual-storyboard-review")
             return {
                 "status": "visual_storyboard_review",
                 "thread_id": thread_id,
@@ -355,7 +363,7 @@ def _graph_response(result: dict, thread_id: str) -> dict:
                     "mood_board_url": _output_url(review.get("mood_board_file")),
                 }
             )
-            artifacts["storage"] = _archive({**result, **artifacts}, thread_id, "reference-board-review")
+            artifacts["storage"] = _archive_stage({**result, **artifacts}, thread_id, "reference-board-review")
             return {
                 "status": "reference_board_review",
                 "thread_id": thread_id,
@@ -370,7 +378,7 @@ def _graph_response(result: dict, thread_id: str) -> dict:
             artifacts["director_plan"] = review["director_plan"]
             artifacts["storyboard"] = review["director_plan"]
             artifacts["count_adjustment"] = review.get("count_adjustment", "")
-            artifacts["storage"] = _archive({**result, **artifacts}, thread_id, "director-plan-review")
+            artifacts["storage"] = _archive_stage({**result, **artifacts}, thread_id, "director-plan-review")
             return {
                 "status": "director_plan_review",
                 "thread_id": thread_id,
@@ -382,7 +390,7 @@ def _graph_response(result: dict, thread_id: str) -> dict:
             }
 
         artifacts["story"] = review["story"]
-        artifacts["storage"] = _archive({**result, **artifacts}, thread_id, "story-review")
+        artifacts["storage"] = _archive_stage({**result, **artifacts}, thread_id, "story-review")
         return {
             "status": "story_review",
             "thread_id": thread_id,
@@ -477,10 +485,31 @@ def _auto_advance(result: dict, thread_id: str) -> dict:
     return result
 
 
-def _resume_review(thread_id: str, node: str, command: dict) -> dict:
+def _track(user_id: str | None, response: dict, **film) -> dict:
+    """Update My films drafts; a bookkeeping failure must never cost the user a film they paid for."""
+    try:
+        record_film(user_id, response, **film)
+    except Exception:
+        logger.exception("Could not update My films drafts for %s", response.get("thread_id"))
+    return response
+
+
+def _settle(user_id: str | None, thread_id: str, response: dict) -> dict:
+    """Spend or release the film's held credit; a bookkeeping failure must never cost the user their film."""
+    try:
+        settle_film(user_id, thread_id, response)
+    except Exception:
+        logger.exception("Could not settle film credit for %s", thread_id)
+    return response
+
+
+def _resume_review(thread_id: str, node: str, command: dict, user_id: str | None) -> dict:
     config = {"configurable": {"thread_id": thread_id}}
     try:
         snapshot = graph.get_state(config)
+        # Approving the storyboard starts paid video; a film already past it resumes paid work.
+        if (node == "review_visual_storyboard" and command.get("action") == "approve") or snapshot.values.get("visual_approved"):
+            hold_film(user_id, thread_id, film_seconds(snapshot.values.get("duration")))
         if node in snapshot.next:
             value = Command(resume=command)
         elif (
@@ -496,13 +525,16 @@ def _resume_review(thread_id: str, node: str, command: dict) -> dict:
             value = None
         else:
             raise HTTPException(status_code=404, detail="Review session not found or already completed.")
-        return _graph_response(_auto_advance(graph.invoke(value, config), thread_id), thread_id)
+        response = _graph_response(_auto_advance(graph.invoke(value, config), thread_id), thread_id)
+        return _track(user_id, _settle(user_id, thread_id, response))
     except HTTPException:
         raise
     except UnsafeContentError as exc:
+        release_film(user_id, thread_id)
         raise HTTPException(status_code=400, detail={"error": str(exc), "categories": exc.categories}) from exc
     except Exception as exc:
         logger.exception("Artifact review failed")
+        release_film(user_id, thread_id)
         raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
 
 
@@ -562,6 +594,7 @@ def resolve_request_models(request: VideoRequest) -> dict[str, str]:
 def create_video(request: VideoRequest, user_id: str | None = Depends(require_user)) -> dict:
     if not request.topic.strip():
         raise HTTPException(status_code=400, detail="Topic is required.")
+    require_film_allowance(user_id, request.duration)
     cast = film_characters(user_id, request.character_ids)
     topic = request.topic.strip()
     for character in cast:
@@ -594,7 +627,10 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
             {"configurable": {"thread_id": thread_id}},
         )
         result = _auto_advance(result, thread_id)
-        return _graph_response(result, thread_id)
+        return _track(
+            user_id, _graph_response(result, thread_id),
+            request=request.model_dump(exclude={"draft_id"}), story_draft_id=request.draft_id,
+        )
     except HTTPException:
         raise
     except UnsafeContentError as exc:
@@ -628,8 +664,8 @@ def story_writer(request: StoryWriterRequest, user_id: str | None = Depends(requ
     }
 
 
-@app.post("/api/review-story", dependencies=[Depends(require_user)])
-def submit_story_review(request: StoryReviewRequest) -> dict:
+@app.post("/api/review-story")
+def submit_story_review(request: StoryReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     thread_id = request.thread_id.strip()
     command = {"action": request.action}
     if request.action == "edit":
@@ -641,54 +677,69 @@ def submit_story_review(request: StoryReviewRequest) -> dict:
         if not note:
             raise HTTPException(status_code=400, detail="Story feedback is required.")
         command["note"] = note
-    return _resume_review(thread_id, "review_story", command)
+    return _resume_review(thread_id, "review_story", command, user_id)
 
 
-@app.post("/api/review-reference-board", dependencies=[Depends(require_user)])
-def submit_reference_review(request: ReferenceReviewRequest) -> dict:
+@app.post("/api/review-reference-board")
+def submit_reference_review(request: ReferenceReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
         note = (request.note or "").strip()
         if not note:
             raise HTTPException(status_code=400, detail="Reference package feedback is required.")
         command["note"] = note
-    return _resume_review(request.thread_id.strip(), "review_reference_package", command)
+    return _resume_review(request.thread_id.strip(), "review_reference_package", command, user_id)
 
 
-@app.post("/api/review-scene-plan", dependencies=[Depends(require_user)])
-def submit_scene_plan_review(request: ScenePlanReviewRequest) -> dict:
+@app.post("/api/review-scene-plan")
+def submit_scene_plan_review(request: ScenePlanReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
-    return _resume_review(request.thread_id.strip(), "review_scene_plan", command)
+    return _resume_review(request.thread_id.strip(), "review_scene_plan", command, user_id)
 
 
-@app.post("/api/review-visual-plan", dependencies=[Depends(require_user)])
-def submit_visual_plan_review(request: VisualPlanReviewRequest) -> dict:
+@app.post("/api/review-visual-plan")
+def submit_visual_plan_review(request: VisualPlanReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
-    return _resume_review(request.thread_id.strip(), "review_visual_plan", command)
+    return _resume_review(request.thread_id.strip(), "review_visual_plan", command, user_id)
 
 
-@app.post("/api/review-shot-plan", dependencies=[Depends(require_user)])
-def submit_shot_plan_review(request: ShotPlanReviewRequest) -> dict:
+@app.post("/api/review-shot-plan")
+def submit_shot_plan_review(request: ShotPlanReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action, "note": (request.note or "").strip()}
-    return _resume_review(request.thread_id.strip(), "review_shot_plan", command)
+    return _resume_review(request.thread_id.strip(), "review_shot_plan", command, user_id)
 
 
-@app.post("/api/review-director-plan", dependencies=[Depends(require_user)])
-def submit_director_review(request: DirectorReviewRequest) -> dict:
+@app.post("/api/review-director-plan")
+def submit_director_review(request: DirectorReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
         command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_director_plan", request.feedback)
-    return _resume_review(request.thread_id.strip(), "review_director_plan", command)
+    return _resume_review(request.thread_id.strip(), "review_director_plan", command, user_id)
 
 
-@app.post("/api/review-visual-storyboard", dependencies=[Depends(require_user)])
-def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest) -> dict:
+@app.post("/api/review-visual-storyboard")
+def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
         command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_visual_storyboard", request.feedback)
     elif request.video_tiers:
         command["video_tiers"] = request.video_tiers
-    return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command)
+    return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command, user_id)
+
+
+@app.get("/api/drafts/{draft_id}/review")
+def reopen_paused_film(draft_id: str, user_id: str | None = Depends(require_user)) -> dict:
+    """The review a paused film is waiting on, rebuilt from its checkpoint so any device can pick it up."""
+    draft = find_draft(user_id, draft_id)
+    if draft["kind"] != "film":
+        raise HTTPException(status_code=404, detail="Draft not found.")
+    snapshot = graph.get_state({"configurable": {"thread_id": draft["thread_id"]}})
+    interrupts = list(getattr(snapshot, "interrupts", ()))
+    if not interrupts:
+        forget_film(user_id, draft_id)
+        raise HTTPException(status_code=410, detail="This film is no longer waiting for a review, so it was removed from your drafts.")
+    response = _graph_response({**snapshot.values, "__interrupt__": interrupts}, draft["thread_id"], archive=False)
+    return {**response, "request": draft["request"]}
 
 
 @app.get("/output/{path:path}", dependencies=[Depends(require_user)])

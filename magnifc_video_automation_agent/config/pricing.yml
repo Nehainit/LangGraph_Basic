@@ -1,0 +1,18 @@
+# Film credits sold through Stripe Checkout. A film uses one credit per started
+# `seconds_per_credit` of its requested length (a 30-second film uses 3 credits).
+# Every account gets one free film up to `free_film_max_seconds`.
+#
+# A film costs about $0.14 per second to make (README "Cost and time per film": ~$4.11 for ~30 s),
+# so keep each pack's price per credit well above ~$1.40.
+currency: usd
+seconds_per_credit: 10
+free_film_max_seconds: 30
+packs:
+  - id: starter
+    name: Starter
+    credits: 12
+    amount_cents: 2900
+  - id: creator
+    name: Creator
+    credits: 40
+    amount_cents: 7900

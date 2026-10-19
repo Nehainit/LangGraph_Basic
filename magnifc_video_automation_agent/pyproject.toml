@@ -16,6 +16,7 @@ dependencies = [
     "pydantic",
     "PyJWT[crypto]",
     "python-dotenv",
+    "stripe",
     "PyYAML",
     "uvicorn",
 ]

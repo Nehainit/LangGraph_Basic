@@ -5,7 +5,7 @@ import { setupWriter } from './writer.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-const KEYS = { draft: 'studio.draft.v2', films: 'studio.films.v1', run: 'studio.run.v2' };
+const KEYS = { draft: 'studio.draft.v2', films: 'studio.films.v1', run: 'studio.run.v2', credits: 'studio.creditsBeforeCheckout' };
 const store = {
   get(key, fallback) {
     try { const value = localStorage.getItem(key); return value ? JSON.parse(value) : fallback; } catch { return fallback; }
@@ -70,6 +70,8 @@ const toastEl = $('#toast');
 
 let catalog = [];
 let run = null; // { thread_id, request, status, response, artifacts }
+let draftId = null; // the My films story draft the form was opened from, so saving updates it
+let draftsById = new Map();
 let shotNotes = new Map(); // shot_id -> note for the storyboard under review
 let tierChoices = new Map(); // shot_id -> video tier the reviewer picked, when it differs from the plan
 const TIER_LABELS = { static: 'Still motion (free)', standard: 'Animated', premium: 'Animated, premium model' };
@@ -113,10 +115,10 @@ function errorText(data, fallback) {
   return data?.error || fallback;
 }
 
-async function post(url, body) {
+async function send(method, url, body) {
   let response;
   try {
-    response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(await authHeaders()) }, body: JSON.stringify(body) });
+    response = await fetch(url, { method, headers: { 'Content-Type': 'application/json', ...(await authHeaders()) }, body: body === undefined ? undefined : JSON.stringify(body) });
   } catch {
     throw new Error('Could not reach the server. Is the backend running?');
   }
@@ -126,9 +128,12 @@ async function post(url, body) {
     throw new Error('Your session has expired. Sign in again to continue.');
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(errorText(data, `The server returned an error (${response.status}).`));
+  if (response.status === 402) openPricing(errorText(data, 'Buy credits to make another film.'));
+  if (!response.ok) throw Object.assign(new Error(errorText(data, `The server returned an error (${response.status}).`)), { status: response.status });
   return data;
 }
+
+const post = (url, body) => send('POST', url, body);
 
 const pad = number => String(number).padStart(2, '0');
 
@@ -200,6 +205,7 @@ function syncForm() {
   const values = formValues();
   $('#charCount').textContent = `${topic.value.length}/2000`;
   $('#durationOut').textContent = `${values.duration} sec`;
+  renderDurationCost(values.duration);
   duration.style.setProperty('--fill', `${((values.duration - duration.min) / (duration.max - duration.min)) * 100}%`);
   $('#summary').textContent = `${values.duration} sec · ${values.language} · ${FORMAT_NAMES[values.aspect_ratio]}`;
   $$('[data-starter]').forEach(chip => chip.classList.toggle('is-active', topic.value.trim() === STARTERS[chip.dataset.starter]));
@@ -220,7 +226,38 @@ function applyValues(values = {}) {
 }
 
 function saveDraft() {
-  store.set(KEYS.draft, formValues());
+  store.set(KEYS.draft, { ...formValues(), draft_id: draftId });
+}
+
+// Saves the form to the account, so the story shows up in My films on any device.
+async function saveStoryDraft() {
+  const { topic: text, ...values } = formValues();
+  const settings = Object.fromEntries(Object.entries(values).filter(([, value]) => value != null));
+  if (!text) {
+    topicError.textContent = 'Write a sentence or two before saving a draft.';
+    topicError.hidden = false;
+    topic.focus();
+    return;
+  }
+  const button = $('#saveDraftButton');
+  button.disabled = true;
+  try {
+    let draft;
+    try {
+      draft = draftId ? await send('PUT', `/api/drafts/${draftId}`, { topic: text, settings }) : null;
+    } catch (error) {
+      if (error.status !== 404) throw error; // Deleted on another device: save it as a new draft instead.
+    }
+    const updated = Boolean(draft);
+    draft ||= await post('/api/drafts', { topic: text, settings });
+    draftId = draft.id;
+    saveDraft();
+    toast(updated ? 'Draft updated in My films.' : 'Draft saved to My films.');
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadCatalog() {
@@ -284,9 +321,12 @@ async function startFilm(event) {
   renderBrief(request);
   showPane('working');
   try {
-    handleResponse(await post('/api/create-video', request));
+    const data = await post('/api/create-video', draftId ? { ...request, draft_id: draftId } : request);
+    // The server swaps the story draft for the film once there is a film to show for it.
+    if (REVIEWS[data.status] || data.video_url) { draftId = null; saveDraft(); }
+    handleResponse(data);
   } catch (error) {
-    showFailure(error.message);
+    if (error.status === 402) backToForm({ keepPrompt: true }); else showFailure(error.message);
   } finally {
     submitButton.disabled = false;
   }
@@ -304,6 +344,7 @@ function handleResponse(data) {
     run.status = 'complete';
     saveFilm(videoUrl);
     store.remove(KEYS.run);
+    loadBilling();
     renderResult(videoUrl);
     return;
   }
@@ -707,7 +748,7 @@ function backToForm({ keepPrompt }) {
   persistRun();
   runCard.hidden = true;
   form.hidden = false;
-  if (!keepPrompt) { topic.value = ''; saveDraft(); }
+  if (!keepPrompt) { topic.value = ''; draftId = null; saveDraft(); }
   syncForm();
   showView('create');
   topic.focus();
@@ -732,7 +773,82 @@ function saveFilm(videoUrl) {
   store.set(KEYS.films, list.slice(0, 48));
 }
 
+// ---------- Drafts ----------
+// Story drafts and films paused at a review live on the account; finished films are still kept in this browser.
+async function renderDrafts() {
+  let list;
+  try {
+    list = (await send('GET', '/api/drafts')).drafts;
+  } catch (error) {
+    $('#draftsSection').hidden = true;
+    toast(`Couldn’t load your drafts: ${error.message}`);
+    return;
+  }
+  draftsById = new Map(list.map(draft => [draft.id, draft]));
+  $('#draftsSection').hidden = !list.length;
+  $('#draftsGrid').replaceChildren(...list.map(draft => {
+    const paused = draft.kind === 'film';
+    const brief = paused ? draft.request : { topic: draft.topic, ...draft.settings };
+    return el('article', { class: 'film' },
+      el('button', { type: 'button', class: 'film-open', 'data-draft': draft.id, 'aria-label': `Continue: ${brief.topic}` },
+        el('span', { class: 'film-thumb' },
+          draft.poster ? el('img', { src: draft.poster, alt: '', loading: 'lazy' }) : '✎',
+          el('span', { class: `film-badge${paused ? ' is-paused' : ''}`, text: paused ? 'Waiting for your review' : 'Story draft' }))),
+      el('p', { class: 'film-prompt', text: brief.topic }),
+      el('div', { class: 'film-meta' },
+        el('span', { text: `${new Date(draft.updated_at * 1000).toLocaleDateString()} · ${FORMAT_NAMES[brief.aspect_ratio] || brief.aspect_ratio || 'Portrait'} · ${brief.duration || 30} sec` }),
+        el('button', { type: 'button', 'data-delete-draft': draft.id, text: 'Delete' })),
+    );
+  }));
+}
+
+function canOpenDraft() {
+  if (run?.status !== 'working' && !run?.busy) return true;
+  toast('A film is being made right now. Open your draft once it’s done.');
+  return false;
+}
+
+function openStoryDraft(draft) {
+  if (!canOpenDraft()) return;
+  if (form.hidden) backToForm({ keepPrompt: true });
+  // Like a restored form, a draft starts on fal.ai rather than its saved platform and models.
+  const { image_provider: _provider, image_model: _image, video_model: _video, ...settings } = draft.settings;
+  applyValues({ ...settings, topic: draft.topic });
+  draftId = draft.id;
+  // Bubbling from the textarea refreshes the @ cast row and saves the form.
+  topic.dispatchEvent(new Event('input', { bubbles: true }));
+  showView('create');
+  topic.focus();
+  toast('Your draft is back in the story box.');
+}
+
+async function openPausedFilm(draft) {
+  if (!canOpenDraft()) return;
+  try {
+    const data = await send('GET', `/api/drafts/${draft.id}/review`);
+    run = { thread_id: data.thread_id, request: data.request, status: data.status, response: data, artifacts: data.artifacts || {} };
+    persistRun();
+    renderBrief(run.request);
+    renderReview(data);
+  } catch (error) {
+    toast(error.message);
+    if (error.status === 410) renderDrafts();
+  }
+}
+
+async function deleteDraft(id) {
+  try {
+    await send('DELETE', `/api/drafts/${id}`);
+  } catch (error) {
+    if (error.status !== 404) { toast(error.message); return; }
+  }
+  if (id === draftId) { draftId = null; saveDraft(); }
+  toast(draftsById.get(id)?.kind === 'film' ? 'Removed from your drafts. Its frames stay on the server.' : 'Draft deleted.');
+  renderDrafts();
+}
+
 function renderFilms() {
+  renderDrafts();
   const list = films();
   $('#filmsEmpty').hidden = list.length > 0;
   $('#filmsGrid').replaceChildren(...list.map(film => el('article', { class: 'film' },
@@ -751,6 +867,111 @@ dialog.addEventListener('close', () => { dialogVideo.pause(); dialogVideo.remove
 dialog.addEventListener('click', event => {
   if (event.target === dialog || event.target.closest('[data-close]')) dialog.close();
 });
+
+// ---------- Credits ----------
+const pricingDialog = $('#pricingDialog');
+const creditsChip = $('#creditsChip');
+let billing = null;
+
+function money(cents, currency) {
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency: currency.toUpperCase() }).format(cents / 100);
+}
+
+async function loadBilling() {
+  try {
+    const response = await fetch('/api/billing', { headers: await authHeaders() });
+    billing = response.ok ? await response.json() : null;
+  } catch {
+    billing = null;
+  }
+  creditsChip.hidden = !billing?.enabled;
+  renderDurationCost(formValues().duration);
+  if (!billing?.enabled) return billing;
+  const spare = billing.spare_credits;
+  if (spare) creditsChip.textContent = `${spare} ${plural(spare, 'credit')}`;
+  else creditsChip.textContent = billing.free_film_left ? '1 free film' : 'Buy credits';
+  return billing;
+}
+
+const plural = (count, word) => (count === 1 ? word : `${word}s`);
+const creditsFor = seconds => Math.max(1, Math.ceil(seconds / billing.seconds_per_credit));
+
+// What the chosen length will cost, shown under the slider before the film starts.
+function renderDurationCost(seconds) {
+  const line = $('#durationCost');
+  line.hidden = !billing?.enabled;
+  if (line.hidden) return;
+  const needed = creditsFor(seconds);
+  if (billing.free_film_left && seconds <= billing.free_film_max_seconds) {
+    line.textContent = 'Free — your first film up to ' + `${billing.free_film_max_seconds} sec is on us`;
+    return;
+  }
+  const cost = `Uses ${needed} ${plural(needed, 'credit')}`;
+  if (billing.spare_credits >= needed) { line.textContent = `${cost} · you have ${billing.spare_credits}`; return; }
+  line.replaceChildren(`${cost} · you have ${billing.spare_credits}. `, el('button', { type: 'button', 'data-buy': '', text: 'Buy credits' }));
+}
+
+function filmLength(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (!minutes) return `${seconds} sec`;
+  return rest ? `${minutes} min ${rest} sec` : `${minutes} min`;
+}
+
+function renderPacks() {
+  $('#pricingPacks').replaceChildren(...(billing?.packs || []).map(pack => el('button', { class: 'pack', type: 'button', 'data-pack': pack.id },
+    el('div', {},
+      el('strong', { text: `${pack.name} · ${pack.credits} credits` }),
+      el('span', { text: `${filmLength(pack.credits * billing.seconds_per_credit)} of film · ${money(Math.round(pack.amount_cents / pack.credits), pack.currency)} per credit` })),
+    el('span', { class: 'pack-price', text: money(pack.amount_cents, pack.currency) }))));
+}
+
+async function openPricing(message) {
+  if (!billing?.packs) await loadBilling();
+  if (!billing?.enabled) return;
+  const rate = `Films use one credit per ${billing.seconds_per_credit} seconds.`;
+  $('#pricingNote').textContent = message || (billing.free_film_left
+    ? `Your first film up to ${billing.free_film_max_seconds} seconds is free. ${rate}`
+    : `You have ${billing.spare_credits} ${plural(billing.spare_credits, 'credit')}. ${rate}`);
+  renderPacks();
+  if (!pricingDialog.open) pricingDialog.showModal();
+}
+
+creditsChip.addEventListener('click', () => openPricing());
+$('#durationCost').addEventListener('click', event => { if (event.target.closest('[data-buy]')) openPricing(); });
+pricingDialog.addEventListener('click', async event => {
+  if (event.target === pricingDialog || event.target.closest('[data-close]')) { pricingDialog.close(); return; }
+  const button = event.target.closest('[data-pack]');
+  if (!button) return;
+  $$('.pack', pricingDialog).forEach(pack => { pack.disabled = true; });
+  try {
+    // A review in progress is already saved in this browser, so leaving for Stripe loses nothing.
+    persistRun();
+    store.set(KEYS.credits, billing.credits);
+    const { url } = await post('/api/billing/checkout', { pack_id: button.dataset.pack });
+    location.assign(url);
+  } catch (error) {
+    toast(error.message);
+    $$('.pack', pricingDialog).forEach(pack => { pack.disabled = false; });
+  }
+});
+
+async function returnFromCheckout() {
+  const outcome = new URLSearchParams(location.search).get('checkout');
+  if (!outcome) return;
+  history.replaceState(null, '', location.pathname + location.hash);
+  if (outcome !== 'success') { toast('Checkout cancelled. You have not been charged.'); return; }
+  toast('Payment received. Adding your credits…');
+  // Stripe's webhook adds the credits, usually within a few seconds of the redirect.
+  const before = store.get(KEYS.credits, 0);
+  store.remove(KEYS.credits);
+  if ((billing?.credits ?? 0) > before) { toast('Your credits are ready.'); return; }
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    if ((await loadBilling())?.credits > before) { toast('Your credits are ready.'); return; }
+  }
+  toast('Your payment went through. Credits can take a minute to appear — refresh soon.');
+}
 
 // ---------- Events ----------
 const mentions = setupMentions({
@@ -792,6 +1013,8 @@ $$('[data-starter]').forEach(button => button.addEventListener('click', () => {
   topic.focus();
 }));
 
+$('#saveDraftButton').addEventListener('click', saveStoryDraft);
+
 $('#helpWrite').addEventListener('click', () => {
   if (topic.value.trim()) {
     toast('Tip: say who it’s about, where it happens, what goes wrong, and how it ends.');
@@ -826,6 +1049,14 @@ document.addEventListener('click', event => {
     dialogVideo.play().catch(() => {});
     return;
   }
+  const draftButton = event.target.closest('[data-draft]');
+  if (draftButton) {
+    const draft = draftsById.get(draftButton.dataset.draft);
+    if (draft?.kind === 'film') openPausedFilm(draft); else if (draft) openStoryDraft(draft);
+    return;
+  }
+  const deleteButton = event.target.closest('[data-delete-draft]');
+  if (deleteButton) { deleteDraft(deleteButton.dataset.deleteDraft); return; }
   const remove = event.target.closest('[data-remove]');
   if (remove) {
     store.set(KEYS.films, films().filter(film => film.thread_id !== remove.dataset.remove));
@@ -849,9 +1080,11 @@ window.addEventListener('beforeunload', event => {
     return;
   }
   if (clerk) clerk.mountUserButton($('#userButton'));
-  await loadCatalog();
+  await Promise.all([loadCatalog(), loadBilling()]);
+  returnFromCheckout();
   // Every session starts on fal.ai (Magnific is only the backend fallback), so the platform is not restored.
-  const { image_provider: _provider, image_model: _image, video_model: _video, ...draft } = store.get(KEYS.draft, {});
+  const { image_provider: _provider, image_model: _image, video_model: _video, draft_id: savedDraftId, ...draft } = store.get(KEYS.draft, {});
+  draftId = savedDraftId || null;
   applyValues(draft);
   mentions.renderCast();
 

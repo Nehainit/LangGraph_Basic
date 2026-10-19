@@ -326,6 +326,21 @@ python -m video_automation.backend
 
 Open [http://127.0.0.1:8001](http://127.0.0.1:8001), enter a story prompt, and start generation. After a few minutes the storyboard appears for review: animate it, or leave notes on shots to redraw them first. Artifacts are written under `outputs/<thread-id>/`.
 
+## Free trial and film credits
+
+With sign-in on and `STRIPE_SECRET_KEY` set, films are priced by length: **one credit per started 10 seconds** (a 30-second film uses 3 credits, a 2-minute film 12). Every account gets **one free film up to 30 seconds**. Credits are sold as packs through Stripe Checkout; the rate, free-film length, packs, and prices live in `config/pricing.yml`. The studio shows a film's cost under the Duration slider before it starts. Without a Stripe key the studio stays free, so local development is unaffected.
+
+- Credits are only spent when a film **finishes**, priced on the length you asked for. Approving the storyboard (where paid video starts) holds them, so one balance cannot fund several films at once; a run that stops without a video releases them.
+- Balances are kept per account in `library/<user>/billing.json`. Stripe's webhook adds credits once a payment clears, and each payment is counted once even when Stripe retries.
+
+To try it locally with Stripe test mode:
+
+```bash
+stripe listen --forward-to localhost:8001/api/stripe/webhook   # prints the whsec_… signing secret
+```
+
+Put the test secret key (`sk_test_…`) and that signing secret in `.env`, restart the backend, and pay with card `4242 4242 4242 4242`. In production, add a webhook endpoint at `<APP_BASE_URL>/api/stripe/webhook` for `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
+
 ## Known limitations
 
 - **Film length follows the narration.** The script targets about 2.2 words per second of the requested length; the final film is as long as the spoken narration.

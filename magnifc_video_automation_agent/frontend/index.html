@@ -34,7 +34,10 @@
       <a class="tab" href="/characters">Characters</a>
       <button class="tab" type="button" data-view="films">My films</button>
     </nav>
-    <div class="account" id="userButton"></div>
+    <div class="account">
+      <button class="credits-chip" id="creditsChip" type="button" hidden></button>
+      <div id="userButton"></div>
+    </div>
   </header>
 
   <main class="main">
@@ -52,7 +55,10 @@
             <div class="mention-menu" id="mentionMenu" role="listbox" aria-label="Saved characters" hidden></div>
             <div class="story-foot">
               <span class="foot-meta"><span id="charCount">0/2000</span><span class="mention-hint">Type <kbd>@</kbd> to add a saved character</span></span>
-              <button class="link-button" type="button" id="helpWrite"><svg class="icon"><use href="#i-spark"/></svg>Help me write</button>
+              <span class="foot-actions">
+                <button class="link-button" type="button" id="saveDraftButton"><svg class="icon"><use href="#i-film"/></svg>Save draft</button>
+                <button class="link-button" type="button" id="helpWrite"><svg class="icon"><use href="#i-spark"/></svg>Help me write</button>
+              </span>
             </div>
           </div>
           <div class="cast" id="castRow" hidden></div>
@@ -95,6 +101,7 @@
               <input type="range" id="duration" name="duration" min="5" max="120" step="5" value="30">
               <output for="duration" id="durationOut">30 sec</output>
             </div>
+            <p class="duration-cost" id="durationCost" hidden></p>
           </div>
 
           <div class="setting">
@@ -234,8 +241,13 @@
 
     <!-- My films -->
     <section class="view films-view" id="filmsView" aria-labelledby="filmsTitle" hidden>
-      <p class="eyebrow">Saved in this browser</p>
+      <p class="eyebrow">Your studio</p>
       <h1 class="headline small" id="filmsTitle">My films</h1>
+      <section class="films-section" id="draftsSection" aria-labelledby="draftsTitle" hidden>
+        <h2 class="films-heading" id="draftsTitle">Drafts <small>Saved to your account</small></h2>
+        <div class="films-grid" id="draftsGrid"></div>
+      </section>
+      <h2 class="films-heading">Finished films <small>Saved in this browser</small></h2>
       <div class="films-grid" id="filmsGrid"></div>
       <div class="empty" id="filmsEmpty">
         <p>No films yet. Your finished films will show up here.</p>
@@ -250,6 +262,16 @@
       <button class="close-button" type="button" data-close aria-label="Close">×</button>
     </div>
     <video id="playerVideo" controls playsinline preload="none"></video>
+  </dialog>
+
+  <dialog class="player-dialog pricing-dialog" id="pricingDialog">
+    <div class="dialog-head">
+      <h2>Film credits</h2>
+      <button class="close-button" type="button" data-close aria-label="Close">×</button>
+    </div>
+    <p class="pricing-note" id="pricingNote">Your first film up to 30 seconds is free. After that, films use one credit per 10 seconds.</p>
+    <div class="packs" id="pricingPacks"></div>
+    <p class="pricing-fine">Credits are only used when a film finishes. Payments are handled securely by Stripe.</p>
   </dialog>
 
   <div class="toast" id="toast" role="status" hidden></div>
