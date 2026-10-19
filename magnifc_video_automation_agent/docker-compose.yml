@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CHECKPOINT_DB: /app/state/langgraph-checkpoints.sqlite
+    volumes:
+      - ./outputs:/app/outputs
+      - ./library:/app/library
+      - ./state:/app/state
+      - ./assets/sound_library/sfx:/app/assets/sound_library/sfx
+      - ./assets/sound_library/music:/app/assets/sound_library/music
+    # Only Caddy talks to the API; port 8001 is never opened to the internet.
+    expose:
+      - "8001"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env, e.g. 140-238-1-2.sslip.io}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

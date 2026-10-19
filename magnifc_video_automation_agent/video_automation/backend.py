@@ -117,7 +117,8 @@ app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
 app.include_router(character_router)
 logger = logging.getLogger(__name__)
 graph = build_story_graph(
-    checkpointer=persistent_checkpointer(ROOT / ".langgraph-checkpoints.sqlite"),
+    # Deployments point CHECKPOINT_DB into a mounted volume so paused films survive restarts.
+    checkpointer=persistent_checkpointer(Path(os.getenv("CHECKPOINT_DB", ROOT / ".langgraph-checkpoints.sqlite"))),
     video_validator=validate_generated_videos,
 )
 MAX_AUTO_RETRIES_PER_STAGE = 2

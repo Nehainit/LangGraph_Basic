@@ -1,0 +1,6 @@
+# Caddy fetches and renews the HTTPS certificate for SITE_ADDRESS automatically.
+{$SITE_ADDRESS} {
+	encode gzip
+	# Film steps can run for minutes; Caddy waits for the API instead of timing out.
+	reverse_proxy api:8001
+}
