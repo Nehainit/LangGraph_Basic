@@ -5,7 +5,7 @@ from video_automation.prompts import story_review_prompt
 from video_automation.schema import validate_story_outline, validate_story_requirements
 
 
-def review_story(parsed_requirements: dict, story: dict, *, review_note: str = "") -> dict:
+def review_story(parsed_requirements: dict, story: dict, *, review_note: str = "", previous_episode: dict | None = None) -> dict:
     """Check a story against user intent and return approval or actionable issues."""
     validate_story_requirements(parsed_requirements)
     validate_story_outline(story)
@@ -13,7 +13,7 @@ def review_story(parsed_requirements: dict, story: dict, *, review_note: str = "
         raise ValueError("Review feedback must be text.")
     model = load_model("story")
     response, evaluation = invoke_with_evaluation(model, story_review_prompt(
-        requirements=parsed_requirements, story=story, review_note=review_note,
+        requirements=parsed_requirements, story=story, review_note=review_note, previous_episode=previous_episode,
     ), agent_name="story-review", purpose="review_story_against_requirements")
     if not isinstance(response.content, str):
         raise ValueError("Story review must be JSON text.")

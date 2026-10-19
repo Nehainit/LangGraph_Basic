@@ -282,6 +282,10 @@ class AgentState(TypedDict):
     characters: str | list[str]
     # Saved characters the user @-mentioned: name, description, and approved sheet file.
     library_characters: NotRequired[list[dict[str, Any]]]
+    # Set when this film is the next episode of a series (see video_automation/series.py).
+    series_id: NotRequired[str]
+    episode_number: NotRequired[int]
+    previous_episode: NotRequired[dict[str, Any]]
     genre: NotRequired[str]
     genre_structure: NotRequired[list[str]]
     output_dir: NotRequired[str]

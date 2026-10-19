@@ -341,6 +341,16 @@ stripe listen --forward-to localhost:8001/api/stripe/webhook   # prints the whse
 
 Put the test secret key (`sk_test_…`) and that signing secret in `.env`, restart the backend, and pay with card `4242 4242 4242 4242`. In production, add a webhook endpoint at `<APP_BASE_URL>/api/stripe/webhook` for `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
 
+## Series and episodes
+
+Any finished film can become episode 1 of a series: choose **Make the next episode** on the result, or **Next episode** on a film in My films, then describe what happens next. The new episode:
+
+- **opens where the previous one ended** — the story agent gets the previous story, its final beat, and one-line recaps of earlier episodes, and its reviewer rejects a first beat that does not continue from that ending;
+- **keeps the same cast and style** — every character is reused through the sheet from the latest episode they appeared in (nothing is redrawn), and the series' visual style overrides the form;
+- **starts on the same frame** — the first shot uses the previous episode's final frame (taken from the last clip at its edit out-point, so no captions) as its continuity reference.
+
+When an episode finishes, its story, ending, cast sheets, locations, style, and final frame are copied to `library/<user>/series/<series-id>/epNN/`, so later episodes still work after `outputs/` is cleared. Each episode is billed like any other film.
+
 ## Known limitations
 
 - **Film length follows the narration.** The script targets about 2.2 words per second of the requested length; the final film is as long as the spoken narration.

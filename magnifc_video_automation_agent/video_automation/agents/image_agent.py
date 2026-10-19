@@ -1362,6 +1362,9 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
     aspect_ratio = str(state.get("aspect_ratio", config["default_aspect_ratio"]))
     resolution = str(config["quality_resolutions"][state.get("video_quality", "standard")])
     character_files = state.get("character_reference_files", [])
+    # A series episode opens on the previous episode's final frame, so its first shot continues that exact moment.
+    opening_frame = (state.get("previous_episode") or {}).get("final_frame_file")
+    opening_shot_id = shots[0]["shot_id"] if opening_frame and Path(opening_frame).is_file() else None
     reference_by_id = {
         character["character_id"]: character_files[index]
         for index, character in enumerate(character_definitions(state))
@@ -1393,6 +1396,8 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
         previous_file = (approved_images if available_images is None else available_images).get(
             prompt_request.get("previous_shot_id")
         )
+        if not previous_file and opening_shot_id and prompt_request.get("shot_id") == opening_shot_id:
+            previous_file = opening_frame
         if previous_file and len(reference_files) < max_references:
             reference_files.append(previous_file)
         location_reference = prompt_request.get("location_reference") or {}
@@ -1521,6 +1526,9 @@ def _generate_requested_shot_images(state: AgentState) -> dict:
                                 for character_id in reference_ids
                             ),
                             *([
+                                "final frame of the previous episode; this shot continues straight on from it, so keep "
+                                "its setting, lighting, wardrobe, and where each character stands"
+                                if previous_file == opening_frame else
                                 "earlier approved shot from this scene; use only for continuity of lighting, wardrobe, "
                                 "and setting, not for composition"
                             ] if previous_file in reference_files else []),

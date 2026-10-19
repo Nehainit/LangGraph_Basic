@@ -62,6 +62,10 @@
             </div>
           </div>
           <div class="cast" id="castRow" hidden></div>
+          <div class="episode-banner" id="episodeBanner" hidden>
+            <span id="episodeText"></span>
+            <button class="link-button" type="button" id="episodeCancel">Make a standalone film instead</button>
+          </div>
           <p class="field-error" id="topicError" role="alert" hidden></p>
 
           <div class="ideas">
@@ -195,6 +199,7 @@
                 </details>
                 <div class="actions">
                   <a class="primary-button compact" id="downloadLink" download="film.mp4">Download film</a>
+                  <button class="secondary-button" type="button" data-action="next-episode">Make the next episode</button>
                   <button class="secondary-button" type="button" data-action="remix">Make another version</button>
                   <button class="link-button" type="button" data-action="fresh">Start a new story</button>
                 </div>

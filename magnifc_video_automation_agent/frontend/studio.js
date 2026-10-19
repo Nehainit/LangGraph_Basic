@@ -5,7 +5,7 @@ import { setupWriter } from './writer.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-const KEYS = { draft: 'studio.draft.v2', films: 'studio.films.v1', run: 'studio.run.v2', credits: 'studio.creditsBeforeCheckout' };
+const KEYS = { draft: 'studio.draft.v2', films: 'studio.films.v1', run: 'studio.run.v2', credits: 'studio.creditsBeforeCheckout', episode: 'studio.episode.v1' };
 const store = {
   get(key, fallback) {
     try { const value = localStorage.getItem(key); return value ? JSON.parse(value) : fallback; } catch { return fallback; }
@@ -321,9 +321,14 @@ async function startFilm(event) {
   renderBrief(request);
   showPane('working');
   try {
-    const data = await post('/api/create-video', draftId ? { ...request, draft_id: draftId } : request);
+    const series = store.get(KEYS.episode, null);
+    const data = await post('/api/create-video', {
+      ...request, ...(draftId ? { draft_id: draftId } : {}), ...(series ? { series_id: series.id } : {}),
+    });
     // The server swaps the story draft for the film once there is a film to show for it.
     if (REVIEWS[data.status] || data.video_url) { draftId = null; saveDraft(); }
+    // The episode is registered on the server now; the next one starts from this film's result.
+    if (series) { store.remove(KEYS.episode); renderEpisode(); }
     handleResponse(data);
   } catch (error) {
     if (error.status === 402) backToForm({ keepPrompt: true }); else showFailure(error.message);
@@ -857,7 +862,9 @@ function renderFilms() {
     el('p', { class: 'film-prompt', text: film.prompt }),
     el('div', { class: 'film-meta' },
       el('span', { text: `${new Date(film.created_at).toLocaleDateString()} · ${FORMAT_NAMES[film.aspect_ratio] || film.aspect_ratio} · ${film.duration} sec` }),
-      el('button', { type: 'button', 'data-remove': film.thread_id, text: 'Remove' })),
+      el('span', { class: 'film-actions' },
+        el('button', { type: 'button', 'data-next-episode': film.thread_id, text: 'Next episode' }),
+        el('button', { type: 'button', 'data-remove': film.thread_id, text: 'Remove' }))),
   )));
 }
 
@@ -867,6 +874,32 @@ dialog.addEventListener('close', () => { dialogVideo.pause(); dialogVideo.remove
 dialog.addEventListener('click', event => {
   if (event.target === dialog || event.target.closest('[data-close]')) dialog.close();
 });
+
+// ---------- Episodes ----------
+// A finished film becomes episode 1 of a series; the next film opens where it ended, with the same cast and style.
+function renderEpisode() {
+  const series = store.get(KEYS.episode, null);
+  $('#episodeBanner').hidden = !series;
+  topic.placeholder = series
+    ? `What happens in episode ${series.next_episode}? It opens where episode ${series.next_episode - 1} ended.`
+    : STARTERS.fable;
+  if (series) $('#episodeText').textContent = `Episode ${series.next_episode} of “${series.title}” · same characters and style`;
+}
+
+async function startNextEpisode(threadId) {
+  try {
+    const series = await post('/api/series', { thread_id: threadId });
+    store.set(KEYS.episode, { id: series.id, title: series.title, next_episode: series.next_episode });
+    if (dialog.open) dialog.close();
+    backToForm({ keepPrompt: false });
+    if (series.aspect_ratio) { setRadio('aspect_ratio', series.aspect_ratio); syncForm(); saveDraft(); }
+    renderEpisode();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+$('#episodeCancel').addEventListener('click', () => { store.remove(KEYS.episode); renderEpisode(); });
 
 // ---------- Credits ----------
 const pricingDialog = $('#pricingDialog');
@@ -1037,6 +1070,7 @@ runCard.addEventListener('click', event => {
   const action = event.target.closest('[data-action]')?.dataset.action;
   if (action === 'remix' || action === 'edit') backToForm({ keepPrompt: true });
   if (action === 'fresh') backToForm({ keepPrompt: false });
+  if (action === 'next-episode' && run?.thread_id) startNextEpisode(run.thread_id);
 });
 
 document.addEventListener('click', event => {
@@ -1057,6 +1091,8 @@ document.addEventListener('click', event => {
   }
   const deleteButton = event.target.closest('[data-delete-draft]');
   if (deleteButton) { deleteDraft(deleteButton.dataset.deleteDraft); return; }
+  const nextEpisode = event.target.closest('[data-next-episode]');
+  if (nextEpisode) { startNextEpisode(nextEpisode.dataset.nextEpisode); return; }
   const remove = event.target.closest('[data-remove]');
   if (remove) {
     store.set(KEYS.films, films().filter(film => film.thread_id !== remove.dataset.remove));
@@ -1087,6 +1123,7 @@ window.addEventListener('beforeunload', event => {
   draftId = savedDraftId || null;
   applyValues(draft);
   mentions.renderCast();
+  renderEpisode();
 
   const saved = store.get(KEYS.run, null);
   if (saved?.status && REVIEWS[saved.status] && saved.response) {

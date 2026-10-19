@@ -30,6 +30,7 @@ from video_automation.auth import public_auth_config, require_user
 from video_automation.billing import film_seconds, hold_film, release_film, require_film_allowance, router as billing_router, settle_film
 from video_automation.character_library import film_characters, router as character_router, saved_character_names
 from video_automation.drafts import find_draft, forget_film, record_film, router as drafts_router
+from video_automation.series import StartSeries, finish_episode, next_episode_state, router as series_router, start_series
 
 
 class VideoRequest(BaseModel):
@@ -48,6 +49,8 @@ class VideoRequest(BaseModel):
     video_model: str | None = None
     # The My films story draft this film was made from; the film replaces it there.
     draft_id: str | None = None
+    # Make this film the next episode of a series, opening where the previous episode ended.
+    series_id: str | None = None
 
     @field_validator("narration_model", "image_model", "video_model")
     @classmethod
@@ -121,6 +124,7 @@ app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
 app.include_router(character_router)
 app.include_router(drafts_router)
 app.include_router(billing_router)
+app.include_router(series_router)
 logger = logging.getLogger(__name__)
 graph = build_story_graph(
     # Deployments point CHECKPOINT_DB into a mounted volume so paused films survive restarts.
@@ -503,6 +507,16 @@ def _settle(user_id: str | None, thread_id: str, response: dict) -> dict:
     return response
 
 
+def _finish_episode(user_id: str | None, thread_id: str, response: dict) -> dict:
+    """Snapshot a finished series episode for the next one; a bookkeeping failure must never cost the user their film."""
+    if response.get("video_url"):
+        try:
+            finish_episode(user_id, thread_id, graph.get_state({"configurable": {"thread_id": thread_id}}).values, response["video_url"])
+        except Exception:
+            logger.exception("Could not save series continuity for %s", thread_id)
+    return response
+
+
 def _resume_review(thread_id: str, node: str, command: dict, user_id: str | None) -> dict:
     config = {"configurable": {"thread_id": thread_id}}
     try:
@@ -526,7 +540,7 @@ def _resume_review(thread_id: str, node: str, command: dict, user_id: str | None
         else:
             raise HTTPException(status_code=404, detail="Review session not found or already completed.")
         response = _graph_response(_auto_advance(graph.invoke(value, config), thread_id), thread_id)
-        return _track(user_id, _settle(user_id, thread_id, response))
+        return _track(user_id, _finish_episode(user_id, thread_id, _settle(user_id, thread_id, response)))
     except HTTPException:
         raise
     except UnsafeContentError as exc:
@@ -604,8 +618,12 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
         validate_model_configuration("shot-image-qa")
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    thread_id = str(uuid.uuid4())
+    # The series cast joins the @-mentioned characters; a mentioned character with the same name wins.
+    episode = next_episode_state(user_id, request.series_id, thread_id, topic) if request.series_id else {}
+    mentioned = {character["name"].casefold() for character in cast}
+    library_cast = [*cast, *(item for item in episode.pop("library_characters", []) if item["name"].casefold() not in mentioned)]
     try:
-        thread_id = str(uuid.uuid4())
         result = graph.invoke(
             {
                 "thread_id": thread_id,
@@ -614,7 +632,7 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
                 "duration": f"{request.duration} seconds",
                 "language": request.language.strip() or "English",
                 "characters": [f"{character['name']}: {character['description']}" for character in cast],
-                "library_characters": cast,
+                "library_characters": library_cast,
                 "output_dir": str(ROOT / "outputs" / thread_id),
                 "quality_mode": request.quality_mode,
                 "aspect_ratio": request.aspect_ratio,
@@ -622,6 +640,8 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
                 "image_provider": request.image_provider,
                 **resolve_request_models(request),
                 **({"visual_style": VISUAL_STYLES[request.visual_style]} if request.visual_style else {}),
+                # A series keeps the style its episodes were drawn in, whatever the form says.
+                **episode,
                 "warnings": [],
             },
             {"configurable": {"thread_id": thread_id}},
@@ -725,6 +745,15 @@ def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest, user
     elif request.video_tiers:
         command["video_tiers"] = request.video_tiers
     return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command, user_id)
+
+
+@app.post("/api/series")
+def create_series(request: StartSeries, user_id: str | None = Depends(require_user)) -> dict:
+    """Start a series from a finished film, which becomes episode 1."""
+    snapshot = graph.get_state({"configurable": {"thread_id": request.thread_id}})
+    if not snapshot.values or snapshot.next:
+        raise HTTPException(status_code=409, detail="Only a finished film can start a series.")
+    return start_series(user_id, request.thread_id, snapshot.values, _output_url(snapshot.values.get("video_file")), request.title)
 
 
 @app.get("/api/drafts/{draft_id}/review")
