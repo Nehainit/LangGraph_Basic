@@ -292,9 +292,14 @@ def _join_clips(clips: list[Path], scenes: list[dict], durations: list[float], o
     )
 
 
-def _audio_mix_command(state: AgentState, timings: list[dict], total_seconds: float, output: Path) -> list[str]:
-    """Mix narration over effects, ambience, and music, ducking the bed whenever narration speaks."""
-    sound = PIPELINE_CONFIG["sound"]
+def _audio_mix_command(state: AgentState, timings: list[dict], total_seconds: float, output: Path, levels: dict | None = None) -> list[str]:
+    """Mix narration over effects, ambience, and music, ducking the bed whenever narration speaks.
+
+    `levels` overrides narration_volume / music_volume / duck_under_narration from config, and may add
+    music_fade, for a user's edit. An edit's recorded voiceovers come in state["voiceover_tracks"], and
+    state["narration_mute_spans"] silences the AI narrator while the user speaks.
+    """
+    sound = {**PIPELINE_CONFIG["sound"], **(levels or {})}
     fade = float(PIPELINE_CONFIG["finishing"].get("fade_seconds") or 0)
     inputs = ["-i", state["narration_file"]]
     filters, bed = [], []
@@ -331,10 +336,28 @@ def _audio_mix_command(state: AgentState, timings: list[dict], total_seconds: fl
     if state.get("music_file"):
         # Library music may be shorter than the film, so it loops and is cut at the film's end.
         index = add_input(state["music_file"], loop=True)
-        filters.append(f"[{index}:a]aresample=44100,atrim=0:{total_seconds:.3f},asetpts=PTS-STARTPTS,volume={sound['music_volume']}[music]")
+        music_fade = ""
+        if sound.get("music_fade") and total_seconds > 4:
+            music_fade = f",afade=t=in:d=1,afade=t=out:st={total_seconds - 1.5:.3f}:d=1.5"
+        filters.append(f"[{index}:a]aresample=44100,atrim=0:{total_seconds:.3f},asetpts=PTS-STARTPTS,volume={sound['music_volume']}{music_fade}[music]")
         bed.append("[music]")
 
     narration = f"[0:a]volume={sound['narration_volume']}"
+    mute_spans = state.get("narration_mute_spans") or []
+    if mute_spans:
+        narration += ",volume=0:enable='" + "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in mute_spans) + "'"
+    voiceovers = []
+    for track in state.get("voiceover_tracks") or []:
+        start_ms = int(float(track["start_seconds"]) * 1000)
+        index = add_input(track["file"])
+        clean = "afftdn=nf=-25," if track.get("clean") else ""
+        filters.append(f"[{index}:a]aresample=44100,{clean}adelay={start_ms}|{start_ms}[vo{index}]")
+        voiceovers.append(f"[vo{index}]")
+    if voiceovers:
+        # The user's own voice joins the narration, so it also ducks the bed.
+        filters.append(f"{narration}[ai]")
+        filters.append(f"[ai]{''.join(voiceovers)}amix=inputs={len(voiceovers) + 1}:duration=longest:normalize=0[voices]")
+        narration = "[voices]anull"
     if not bed:
         filters.append(f"{narration}[mix]")
     else:
@@ -370,9 +393,7 @@ def edit_video(state: AgentState) -> dict[str, str]:
     _validate_counts(state, timings)
     total_seconds = max(float(timing["end_seconds"]) for timing in timings)
     width, height = _resolution(state)
-    approved_rough_cut = Path(state["rough_cut_file"]) if (
-        state.get("combined_video_judge_approved") or state.get("combined_video_judge_error_exhausted")
-    ) and state.get("rough_cut_file") else None
+    approved_rough_cut = _approved_rough_cut(state)
     clips = []
     durations = []
     scene_video_files = state.get("scene_video_files") or []
@@ -418,8 +439,30 @@ def edit_video(state: AgentState) -> dict[str, str]:
         ]
         _join_clips(clips, edit_scenes, durations, picture_track)
 
-    _run_ffmpeg(_audio_mix_command(state, timings, total_seconds, mixed_audio_file))
-    overlays = _caption_overlays(state, out)
+    _render_final(state, picture_track, timings, total_seconds, out, video_file, mixed_audio_file)
+    return {"mixed_audio_file": str(mixed_audio_file), "video_file": str(video_file)}
+
+
+def _approved_rough_cut(state: AgentState) -> Path | None:
+    return Path(state["rough_cut_file"]) if (
+        state.get("combined_video_judge_approved") or state.get("combined_video_judge_error_exhausted")
+    ) and state.get("rough_cut_file") else None
+
+
+def _render_final(
+    state: AgentState, picture_track: Path, timings: list[dict], total_seconds: float, out: Path,
+    video_file: Path, mixed_audio_file: Path, *, grade: str | None = None, captions: bool = True, levels: dict | None = None,
+    overlays: list[tuple[Path, float, float]] | None = None, grade_strength: float = 1.0,
+) -> None:
+    """Mix the sound and lay it, the captions, the grade, and the fades over the finished picture track.
+
+    An edit passes its own `overlays` (styled captions and text) in place of the pipeline's captions, and a
+    `grade_strength` below 1 blends the grade with the ungraded picture.
+    """
+    _run_ffmpeg(_audio_mix_command(state, timings, total_seconds, mixed_audio_file, levels))
+    edit_overlays = overlays is not None
+    if overlays is None:
+        overlays = _caption_overlays(state, out) if captions else []
     final_command = [
         "ffmpeg",
         "-y",
@@ -429,20 +472,26 @@ def edit_video(state: AgentState) -> dict[str, str]:
         str(mixed_audio_file),
     ]
     for caption_file, _, _ in overlays:
-        final_command.extend(["-loop", "1", "-i", str(caption_file)])
+        # An edit can have one image per spoken word; a single still frame, held by overlay, keeps that cheap.
+        final_command.extend(["-i", str(caption_file)] if edit_overlays else ["-loop", "1", "-i", str(caption_file)])
 
     finishing = PIPELINE_CONFIG["finishing"]
-    grade = str(finishing.get("color_grade") or "").strip()
+    grade = str(finishing.get("color_grade") or "").strip() if grade is None else grade.strip()
     fade = float(finishing.get("fade_seconds") or 0)
     current = "[0:v]"
     filters = []
-    if grade:
+    if grade and grade_strength < 1:
+        filters.append(f"{current}split[plain][tograde];[tograde]{grade}[full];[plain][full]blend=all_mode=normal:all_opacity={grade_strength:.2f}[graded]")
+        current = "[graded]"
+    elif grade:
         # One grade over the whole picture, applied before captions so text keeps its colours.
         filters.append(f"{current}{grade}[graded]")
         current = "[graded]"
     for index, (_, start, end) in enumerate(overlays, start=2):
         output = f"[v{index}]"
-        filters.append(f"{current}[{index}:v]overlay=0:0:enable='between(t,{start},{end})'{output}")
+        # An edit's word-by-word captions meet end to end; a half-open window shows exactly one at each frame.
+        window = f"gte(t,{start})*lt(t,{end})" if edit_overlays else f"between(t,{start},{end})"
+        filters.append(f"{current}[{index}:v]overlay=0:0:enable='{window}'{output}")
         current = output
     if fade and total_seconds > 2 * fade:
         filters.append(f"{current}fade=t=in:st=0:d={fade},fade=t=out:st={total_seconds - fade:.3f}:d={fade}[faded]")
@@ -467,4 +516,38 @@ def edit_video(state: AgentState) -> dict[str, str]:
         ]
     )
     _run_ffmpeg(final_command)
-    return {"mixed_audio_file": str(mixed_audio_file), "video_file": str(video_file)}
+
+
+def remix_video(
+    state: AgentState, video_file: Path, *, grade: str | None, captions: bool, levels: dict,
+    overlays: list[tuple[Path, float, float]] | None = None, grade_strength: float = 1.0,
+    trim: tuple[float, float] | None = None, speed: float = 1.0,
+) -> None:
+    """Re-render a finished film's sound and finish over its existing picture; nothing is regenerated or paid for.
+
+    `state` carries the edit's music_file, sound_cues, and voiceovers in place of the ones the pipeline chose.
+    Trim and speed apply last, to the finished cut, so every time in the edit stays on the film's own clock.
+    """
+    out = _out_dir(state, "video")
+    rough_cut = _approved_rough_cut(state)
+    picture_track = rough_cut if rough_cut and rough_cut.is_file() else out / "picture_track.mp4"
+    if not picture_track.is_file():
+        raise RuntimeError("This film's picture track is no longer on the server, so it can't be edited.")
+    timings = _scene_timings(state)
+    total_seconds = max(float(timing["end_seconds"]) for timing in timings)
+    reshape = speed != 1 or (trim and (trim[0] > 0 or trim[1] < total_seconds))
+    full_cut = video_file.with_name(f"{video_file.stem}_full.mp4") if reshape else video_file
+    _render_final(
+        state, picture_track, timings, total_seconds, out, full_cut, video_file.with_suffix(".mp3"),
+        grade=grade, captions=captions, levels=levels, overlays=overlays, grade_strength=grade_strength,
+    )
+    if not reshape:
+        return
+    start, end = trim or (0.0, total_seconds)
+    # atempo keeps the narrator's pitch natural at any speed between 0.5x and 2x.
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(full_cut),
+        "-filter:v", f"setpts=PTS/{speed}", "-filter:a", f"atempo={speed}",
+        "-r", "30", "-c:v", "libx264", "-c:a", "aac", str(video_file),
+    ])
+    full_cut.unlink(missing_ok=True)

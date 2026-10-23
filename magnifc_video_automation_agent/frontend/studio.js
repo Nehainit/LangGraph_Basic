@@ -1,6 +1,7 @@
 import { authHeaders, goToSignIn, loadClerk } from './auth.js';
 import { mentionedCharacters, setupMentions } from './mentions.js';
 import { setupWriter } from './writer.js';
+import { setupEdits } from './edits.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -147,12 +148,15 @@ function showView(name) {
   $('#createView').hidden = name !== 'create';
   $('#filmsView').hidden = name !== 'films';
   $('#writerView').hidden = name !== 'writer';
+  $('#editsView').hidden = name !== 'edits';
+  document.body.classList.toggle('edits-mode', name === 'edits');
   $$('.tab').forEach(tab => {
     const active = tab.dataset.view === name;
     tab.classList.toggle('is-active', active);
     if (active) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
   });
   if (name === 'films') renderFilms();
+  if (name === 'edits') edits.show(); else edits.hide();
   if (name === 'writer') { writer?.render(); $('#chatInput').focus(); }
 }
 
@@ -167,6 +171,7 @@ function formValues() {
     visual_style: data.get('visual_style'),
     video_quality: data.get('video_quality'),
     quality_mode: data.get('quality_mode'),
+    voice_mode: data.get('voice_mode') || 'narration',
     image_provider: data.get('image_provider'),
     character_ids: mentionedCharacters(topic.value).map(character => character.id),
   };
@@ -205,6 +210,9 @@ function syncForm() {
   const values = formValues();
   $('#charCount').textContent = `${topic.value.length}/2000`;
   $('#durationOut').textContent = `${values.duration} sec`;
+  $('#voiceHint').textContent = values.voice_mode === 'lipsync'
+    ? 'The characters say their own lines in their own voices, with mouths synced (about $0.005 per synced second).'
+    : 'One narrator tells the story over the pictures.';
   renderDurationCost(values.duration);
   duration.style.setProperty('--fill', `${((values.duration - duration.min) / (duration.max - duration.min)) * 100}%`);
   $('#summary').textContent = `${values.duration} sec · ${values.language} · ${FORMAT_NAMES[values.aspect_ratio]}`;
@@ -215,7 +223,7 @@ function applyValues(values = {}) {
   if (typeof values.topic === 'string') topic.value = values.topic;
   if (values.duration) duration.value = values.duration;
   if (values.language) language.value = values.language;
-  ['aspect_ratio', 'visual_style', 'video_quality', 'quality_mode', 'image_provider'].forEach(name => {
+  ['aspect_ratio', 'visual_style', 'video_quality', 'quality_mode', 'image_provider', 'voice_mode'].forEach(name => {
     if (values[name]) setRadio(name, values[name]);
   });
   syncModels();
@@ -863,6 +871,7 @@ function renderFilms() {
     el('div', { class: 'film-meta' },
       el('span', { text: `${new Date(film.created_at).toLocaleDateString()} · ${FORMAT_NAMES[film.aspect_ratio] || film.aspect_ratio} · ${film.duration} sec` }),
       el('span', { class: 'film-actions' },
+        el('button', { type: 'button', 'data-edit-film': film.thread_id, text: 'Edit' }),
         el('button', { type: 'button', 'data-next-episode': film.thread_id, text: 'Next episode' }),
         el('button', { type: 'button', 'data-remove': film.thread_id, text: 'Remove' }))),
   )));
@@ -874,6 +883,21 @@ dialog.addEventListener('close', () => { dialogVideo.pause(); dialogVideo.remove
 dialog.addEventListener('click', event => {
   if (event.target === dialog || event.target.closest('[data-close]')) dialog.close();
 });
+
+// ---------- Edits tab ----------
+const edits = setupEdits({
+  toast,
+  // Films this browser made before the server kept a list; the Edits tab adds the finished ones.
+  knownFilms: () => films().map(film => film.thread_id),
+  onExported(threadId, videoUrl) {
+    store.set(KEYS.films, films().map(film => (film.thread_id === threadId ? { ...film, video_url: videoUrl } : film)));
+  },
+});
+
+function openInEdits(threadId) {
+  showView('edits');
+  edits.open(threadId);
+}
 
 // ---------- Episodes ----------
 // A finished film becomes episode 1 of a series; the next film opens where it ended, with the same cast and style.
@@ -1071,6 +1095,7 @@ runCard.addEventListener('click', event => {
   if (action === 'remix' || action === 'edit') backToForm({ keepPrompt: true });
   if (action === 'fresh') backToForm({ keepPrompt: false });
   if (action === 'next-episode' && run?.thread_id) startNextEpisode(run.thread_id);
+  if (action === 'open-edits' && run?.thread_id) openInEdits(run.thread_id);
 });
 
 document.addEventListener('click', event => {
@@ -1091,6 +1116,8 @@ document.addEventListener('click', event => {
   }
   const deleteButton = event.target.closest('[data-delete-draft]');
   if (deleteButton) { deleteDraft(deleteButton.dataset.deleteDraft); return; }
+  const editFilm = event.target.closest('[data-edit-film]');
+  if (editFilm) { openInEdits(editFilm.dataset.editFilm); return; }
   const nextEpisode = event.target.closest('[data-next-episode]');
   if (nextEpisode) { startNextEpisode(nextEpisode.dataset.nextEpisode); return; }
   const remove = event.target.closest('[data-remove]');
@@ -1108,7 +1135,7 @@ window.addEventListener('beforeunload', event => {
 // ---------- Boot ----------
 (async function boot() {
   // Open the linked view before sign-in and the model list load, so clicks never land on the wrong view.
-  const linked = { '#films': 'films', '#writer': 'writer' }[location.hash];
+  const linked = { '#films': 'films', '#writer': 'writer', '#edits': 'edits' }[location.hash];
   if (linked) showView(linked);
   const { clerk } = await loadClerk().catch(() => ({ clerk: null }));
   if (clerk && !clerk.isSignedIn) {

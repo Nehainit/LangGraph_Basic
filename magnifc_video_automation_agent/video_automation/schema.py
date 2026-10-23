@@ -284,6 +284,9 @@ class AgentState(TypedDict):
     library_characters: NotRequired[list[dict[str, Any]]]
     # Set when this film is the next episode of a series (see video_automation/series.py).
     series_id: NotRequired[str]
+    # "narration": one narrator tells the film; "lipsync": the characters speak their lines with synced mouths.
+    voice_mode: NotRequired[Literal["narration", "lipsync"]]
+    lip_synced_shots: NotRequired[list[str]]
     episode_number: NotRequired[int]
     previous_episode: NotRequired[dict[str, Any]]
     genre: NotRequired[str]

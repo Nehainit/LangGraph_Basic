@@ -1,8 +1,21 @@
 // Loads Clerk when the server has sign-in configured. Without CLERK_PUBLISHABLE_KEY the studio runs open for local development.
 
 const APPEARANCE = {
+  // The studio's dark theme, so sign-in and the account menu match the rest of the site.
   variables: {
-    colorPrimary: '#1d6ef2',
+    colorPrimary: '#2f74f5',
+    colorPrimaryForeground: '#ffffff',
+    colorBackground: '#151a22',
+    colorForeground: '#e9edf4',
+    colorMutedForeground: '#a3adbd',
+    colorInput: '#0d1016',
+    colorInputForeground: '#e9edf4',
+    colorNeutral: '#e9edf4',
+    colorBorder: '#3a4357',
+    colorMuted: '#1c2330',
+    colorDanger: '#ff8f8f',
+    colorShadow: '#000000',
+    colorModalBackdrop: 'rgba(0, 0, 0, 0.6)',
     fontFamily: "'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     borderRadius: '12px',
   },

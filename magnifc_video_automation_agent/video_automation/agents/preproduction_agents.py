@@ -597,7 +597,8 @@ def create_narration_script(state: AgentState) -> dict:
     hindi = str(language).strip().casefold() in {"hindi", "hi"}
     formula = _narration_formula(float(seconds))
     call_to_action = _call_to_action(state)
-    if (PIPELINE_CONFIG.get("narration") or {}).get("dialogue_only"):
+    # A "Characters speak" film is voiced only by its characters' lines, like the dialogue_only setting.
+    if (PIPELINE_CONFIG.get("narration") or {}).get("dialogue_only") or state.get("voice_mode") == "lipsync":
         dialogue = _dialogue_narration(state, story, language, hindi)
         if dialogue:
             return dialogue

@@ -107,6 +107,14 @@ pipeline:
     color_grade: "eq=contrast=1.04:saturation=1.06,vignette=angle=PI/6"
     fade_seconds: 0.5
 
+  # "Characters speak" films: each shot that shows its speaker gets its mouth synced to the line on fal.ai.
+  # LatentSync is the cheapest model (about $0.005 per second of synced clip); a failed sync keeps the clip.
+  lip_sync:
+    model: fal-ai/latentsync
+    usd_per_second: 0.005
+    # A shot needs at least this much of one character's speech to be synced.
+    min_speech_seconds: 0.4
+
   budget:
     # Paid calls stop once a video would cost more than this. Redos then keep the best result so far
     # (or free FFmpeg camera motion for video); a first-time image that cannot be afforded stops the run.

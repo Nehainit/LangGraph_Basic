@@ -1,8 +1,8 @@
 FROM python:3.13-slim
 
-# ffmpeg/ffprobe do the final edit, audio mix, and video validation.
+# ffmpeg/ffprobe do the final edit, audio mix, and video validation; DejaVu fonts draw captions and Edits text.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1

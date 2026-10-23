@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
@@ -31,6 +31,9 @@ from video_automation.billing import film_seconds, hold_film, release_film, requ
 from video_automation.character_library import film_characters, router as character_router, saved_character_names
 from video_automation.drafts import find_draft, forget_film, record_film, router as drafts_router
 from video_automation.series import StartSeries, finish_episode, next_episode_state, router as series_router, start_series
+from video_automation.edits import (
+    FilmEdits, editable, editor_payload, film_card, remember_films, render_edit, save_draft, save_voiceover, sound_catalog, sound_file,
+)
 
 
 class VideoRequest(BaseModel):
@@ -51,6 +54,8 @@ class VideoRequest(BaseModel):
     draft_id: str | None = None
     # Make this film the next episode of a series, opening where the previous episode ended.
     series_id: str | None = None
+    # Narrator voice-over, or the characters speaking their own lines with lip-synced mouths.
+    voice_mode: Literal["narration", "lipsync"] = "narration"
 
     @field_validator("narration_model", "image_model", "video_model")
     @classmethod
@@ -119,6 +124,15 @@ class VisualStoryboardReviewRequest(DirectorReviewRequest):
 
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def revalidate_static_files(request, call_next):
+    """Make browsers check for a newer studio script or stylesheet on every load, so an update shows at once."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 app.mount("/static", StaticFiles(directory=FRONTEND), name="frontend")
 app.mount("/examples", StaticFiles(directory=ROOT / "demo"), name="examples")
 app.include_router(character_router)
@@ -511,6 +525,11 @@ def _finish_episode(user_id: str | None, thread_id: str, response: dict) -> dict
     """Snapshot a finished series episode for the next one; a bookkeeping failure must never cost the user their film."""
     if response.get("video_url"):
         try:
+            # The Edits tab lists every finished film.
+            remember_films(user_id, [thread_id])
+        except Exception:
+            logger.exception("Could not add %s to the Edits tab", thread_id)
+        try:
             finish_episode(user_id, thread_id, graph.get_state({"configurable": {"thread_id": thread_id}}).values, response["video_url"])
         except Exception:
             logger.exception("Could not save series continuity for %s", thread_id)
@@ -638,6 +657,7 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
                 "aspect_ratio": request.aspect_ratio,
                 "video_quality": request.video_quality,
                 "image_provider": request.image_provider,
+                "voice_mode": request.voice_mode,
                 **resolve_request_models(request),
                 **({"visual_style": VISUAL_STYLES[request.visual_style]} if request.visual_style else {}),
                 # A series keeps the style its episodes were drawn in, whatever the form says.
@@ -745,6 +765,76 @@ def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest, user
     elif request.video_tiers:
         command["video_tiers"] = request.video_tiers
     return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command, user_id)
+
+
+def _finished_film(thread_id: str) -> dict:
+    snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+    if not snapshot.values or snapshot.next or not snapshot.values.get("video_file"):
+        raise HTTPException(status_code=404, detail="Finished film not found.")
+    return snapshot.values
+
+
+@app.get("/api/sounds", dependencies=[Depends(require_user)])
+def sounds() -> dict:
+    return sound_catalog()
+
+
+@app.get("/api/sounds/{sound_id}", dependencies=[Depends(require_user)])
+def sound(sound_id: str) -> FileResponse:
+    return FileResponse(sound_file(sound_id))
+
+
+@app.get("/api/edits/films")
+def edits_films(known: str = "", user_id: str | None = Depends(require_user)) -> dict:
+    """The Edits tab's films: every finished film this account has made, newest first.
+
+    `known` lists films this browser remembers from before films were kept on the server; finished ones are added.
+    """
+    claimed = []
+    for thread_id in [item.strip() for item in known.split(",") if item.strip()][:100]:
+        snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+        if snapshot.values and not snapshot.next and snapshot.values.get("video_file"):
+            claimed.append(thread_id)
+    films = []
+    for thread_id in remember_films(user_id, claimed):
+        values = graph.get_state({"configurable": {"thread_id": thread_id}}).values
+        if values and editable(values):
+            films.append(film_card(values, thread_id, _output_url))
+    return {"films": films}
+
+
+@app.get("/api/films/{thread_id}/edits", dependencies=[Depends(require_user)])
+def film_edits(thread_id: str) -> dict:
+    return editor_payload(_finished_film(thread_id), _output_url)
+
+
+@app.put("/api/films/{thread_id}/edits", dependencies=[Depends(require_user)])
+def autosave_film_edits(thread_id: str, edits: FilmEdits) -> dict:
+    return save_draft(_finished_film(thread_id), edits)
+
+
+@app.post("/api/films/{thread_id}/edits")
+def export_film_edits(thread_id: str, edits: FilmEdits, user_id: str | None = Depends(require_user)) -> dict:
+    """Render the edit with FFmpeg as the film's next version; the original film is kept."""
+    values = _finished_film(thread_id)
+    try:
+        result = render_edit(values, edits)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Film edit failed for %s", thread_id)
+        raise HTTPException(status_code=500, detail={"error": f"The edit could not be exported: {exc}"}) from exc
+    remember_films(user_id, [thread_id])
+    return {"version": result["version"], "video_url": _output_url(result["video_file"])}
+
+
+@app.post("/api/films/{thread_id}/voiceovers", dependencies=[Depends(require_user)])
+async def upload_voiceover(thread_id: str, request: Request) -> dict:
+    """Store a voiceover recorded in the editor; the edit places it on the film's clock."""
+    values = _finished_film(thread_id)
+    data = await request.body()
+    result = save_voiceover(values, data, request.headers.get("content-type", ""))
+    return {"id": result["id"], "seconds": result["seconds"], "url": _output_url(result["file"])}
 
 
 @app.post("/api/series")

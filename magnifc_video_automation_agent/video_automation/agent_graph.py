@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from video_automation.agents.combined_video_judge import combined_video_judge
 from video_automation.agents.editor_agent import edit_video
 from video_automation.agents.edit_timeline_agent import plan_edit_timeline
+from video_automation.agents.lip_sync_agent import lip_sync_shots
 from video_automation.agents.image_agent import (
     build_image_prompts, create_reference_package, create_visual_storyboard, prefetch_character_sheets,
 )
@@ -164,7 +165,7 @@ def build_story_graph(
     def route_edit_timeline(state: AgentState) -> str:
         if state.get("edit_timeline_exhausted_shots"):
             return END
-        return "create_scene_videos" if state.get("video_retry_shots") else "compile_rough_video"
+        return "create_scene_videos" if state.get("video_retry_shots") else "lip_sync"
 
     def route_rough_compilation(state: AgentState) -> str:
         if state.get("compilation_status") == "success":
@@ -242,6 +243,9 @@ def build_story_graph(
     if video_validator:
         graph.add_node("validate_videos", _logged_step("validate_videos", video_validator))
         graph.add_node("plan_edit_timeline", _logged_step("plan_edit_timeline", timeline_planner))
+        # A no-op unless the film's voice is "Characters speak"; then speaking shots get lip-synced clips.
+        graph.add_node("lip_sync", _logged_step("lip_sync", lip_sync_shots))
+        graph.add_edge("lip_sync", "compile_rough_video")
         graph.add_node("compile_rough_video", _logged_step("compile_rough_video", rough_video_compiler))
         graph.add_node("combined_video_judge", _logged_step("combined_video_judge", video_judge))
         graph.add_edge("create_scene_videos", "validate_videos")

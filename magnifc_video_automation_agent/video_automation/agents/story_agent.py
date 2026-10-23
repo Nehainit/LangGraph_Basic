@@ -127,6 +127,7 @@ def create_story(user_input: str | dict) -> dict:
     }
     review_note = user_input.get("review_note", "")
     previous_episode = user_input.get("previous_episode")
+    voice_mode = user_input.get("voice_mode") or "narration"
     original_story = user_input.get("story_outline") or user_input.get("story")
     previous_story = original_story
     requirements = deepcopy(user_input.get("parsed_requirements"))
@@ -140,7 +141,7 @@ def create_story(user_input: str | dict) -> dict:
         response, evaluation = invoke_with_evaluation(model, story_prompt(
             user_request=user_request if requirements is None else None,
             requirements=requirements, previous_story=previous_story,
-            review_note=review_note, feedback=feedback, previous_episode=previous_episode,
+            review_note=review_note, feedback=feedback, previous_episode=previous_episode, voice_mode=voice_mode,
         ), agent_name="story", purpose="generate_story_and_requirements" if requirements is None else "regenerate_story")
         evaluations.append(evaluation)
         try:
@@ -164,7 +165,7 @@ def create_story(user_input: str | dict) -> dict:
             story_text = " ".join(beat["description"] for beat in previous_story["structure"])
             if review_note and (previous_story == original_story or story_text == original_story):
                 raise ValueError("Apply the human revision note instead of returning the unchanged story.")
-            review = review_story(requirements, previous_story, review_note=review_note, previous_episode=previous_episode)
+            review = review_story(requirements, previous_story, review_note=review_note, previous_episode=previous_episode, voice_mode=voice_mode)
             evaluations.append(review.pop("llm_evaluation"))
             if review["approved"]:
                 for number, item in enumerate(evaluations, start=1):

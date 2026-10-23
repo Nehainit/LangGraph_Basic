@@ -351,6 +351,20 @@ Any finished film can become episode 1 of a series: choose **Make the next episo
 
 When an episode finishes, its story, ending, cast sheets, locations, style, and final frame are copied to `library/<user>/series/<series-id>/epNN/`, so later episodes still work after `outputs/` is cleared. Each episode is billed like any other film.
 
+## Edits tab
+
+The **Edits** tab lists every finished film on your account (only films whose final video is on the server). Pick one to open a dark, Instagram Edits-style editor: a live 9:16 preview, a tool rail, and a timeline with lanes for video, text, captions, voice, music, and sound effects.
+
+- **Music** — search or browse the royalty-free library by mood; music and voice volume, automatic lowering under the narrator, and fades.
+- **Sound FX** — pick an effect by category, add it at the playhead, drag it along the timeline, change its volume.
+- **Text** — six styles (Highlight, Bold, Serif, Outline, Typewriter, Label), five colours, size, start and end; drag it on the preview to place it.
+- **Captions** — Bold pop, Word highlight (the spoken word lights up), Boxed, Minimal, Storybook, or off; top, middle, or bottom.
+- **Filters** — nine looks with a strength slider.
+- **Trim & speed** — trim both ends and play at 0.5×–2×; the narrator keeps a natural pitch.
+- **Voiceover** — record over the film from the playhead after a 3-second count, optionally muting the AI narrator and cleaning background noise.
+
+Everything previews live from the film's separate parts, with undo/redo, and autosaves. **Export** renders the edit with FFmpeg over the existing picture and narration as a new version (nothing is regenerated or paid for); the original film is kept and **Continue editing** reopens it later. Edits live in an `edits/` folder beside the film's final video; at most two exports render at once.
+
 ## Known limitations
 
 - **Film length follows the narration.** The script targets about 2.2 words per second of the requested length; the final film is as long as the spoken narration.
