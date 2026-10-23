@@ -96,3 +96,36 @@ export function goToSignIn() {
   const here = `${location.pathname}${location.search}`;
   location.replace(`/sign-in?redirect_url=${encodeURIComponent(here)}`);
 }
+
+/**
+ * Whether this account may use the studio. An account that is not on the server's invite list gets a full-page
+ * notice with a way to sign out, instead of a studio where every action fails. Resolves to true when allowed.
+ */
+export async function ensureAccess(clerk) {
+  let response;
+  try {
+    response = await fetch('/api/me', { headers: await authHeaders() });
+  } catch {
+    return true; // A network hiccup is reported by the first real request.
+  }
+  if (response.status !== 403 && response.status !== 503) return true;
+  const data = await response.json().catch(() => ({}));
+  const message = data?.detail?.error || data?.detail || 'This studio is not available right now.';
+  const main = document.querySelector('main');
+  const card = document.createElement('section');
+  card.className = 'no-access';
+  card.innerHTML = '<h1>Invite only</h1><p></p>';
+  card.querySelector('p').textContent = message;
+  if (clerk) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary-button';
+    button.textContent = 'Sign out';
+    button.addEventListener('click', () => clerk.signOut());
+    card.append(button);
+  }
+  main.replaceChildren(card);
+  const tabs = document.querySelector('.tabs');
+  if (tabs) tabs.style.visibility = 'hidden'; // hidden, but still holding its place so the account button stays right
+  return false;
+}

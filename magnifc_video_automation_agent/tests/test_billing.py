@@ -202,7 +202,7 @@ def test_storyboard_approval_spends_the_free_film_then_asks_for_credits(stripe_o
 
     class StoryboardGraph:
         def get_state(self, _config):
-            return SimpleNamespace(next=("review_visual_storyboard",), values={"duration": "30 seconds"}, tasks=())
+            return SimpleNamespace(next=("review_visual_storyboard",), values={"duration": "30 seconds", "owner_id": USER}, tasks=())
 
         def invoke(self, _value, _config):
             return {"story": "Story.", "storyboard": [], "warnings": [], "video_file": str(backend.ROOT / "outputs/film.mp4")}

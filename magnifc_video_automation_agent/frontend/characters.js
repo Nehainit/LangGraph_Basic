@@ -1,4 +1,4 @@
-import { authHeaders, goToSignIn, loadClerk } from './auth.js';
+import { authHeaders, ensureAccess, goToSignIn, loadClerk } from './auth.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -481,6 +481,7 @@ window.addEventListener('beforeunload', event => {
     return;
   }
   if (clerk) clerk.mountUserButton($('#userButton'));
+  if (!(await ensureAccess(clerk))) return;
   try {
     library = await api('GET', '/api/characters');
   } catch (error) {

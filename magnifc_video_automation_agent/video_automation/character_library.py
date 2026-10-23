@@ -129,12 +129,22 @@ def _draw(prompt: str, image_file: Path, references: list[str], labels: list[str
 
 
 def _draw_or_fail(prompt: str, image_file: Path, references: list[str], labels: list[str], note: str) -> None:
+    from video_automation.cost_control import image_price
+    from video_automation.guard import DailyCapReached, charge_today, refund_today
+
+    # Library drawings are paid like film frames, so they count toward the studio's daily cap.
+    key = f"character:{image_file}"
+    try:
+        charge_today(key, image_price(IMAGE_STATE))
+    except DailyCapReached as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     try:
         _draw(prompt, image_file, references, labels, note)
     except PendingJobError as exc:
         # Asking again with the same request resumes the provider job instead of paying for a new one.
         raise HTTPException(status_code=504, detail="Still drawing. Try again in a minute to pick up the same drawing.") from exc
     except Exception as exc:
+        refund_today(key)
         logger.exception("Character drawing failed for %s", image_file)
         raise HTTPException(status_code=502, detail=f"The drawing failed: {exc}") from exc
 
@@ -251,9 +261,17 @@ def delete_character(character_id: str, user_id: str | None = Depends(require_us
     return {"deleted": character_id}
 
 
+def use_quota(user_id: str | None, kind: str) -> None:
+    """The account's daily drawing limit (video_automation/guard.py imports this module, so it loads late)."""
+    from video_automation.guard import use_quota as count_use
+
+    count_use(user_id, kind)
+
+
 @router.post("/api/characters/{character_id}/sheet")
 def draw_sheet(character_id: str, request: RedrawRequest, user_id: str | None = Depends(require_user)) -> dict:
     folder = _character_dir(user_id, character_id)
+    use_quota(user_id, "drawings")
     with _drawing(folder):
         record = _read(folder)
         current = folder / record["sheet"] if record.get("sheet") else None
@@ -290,6 +308,7 @@ def draw_sheet(character_id: str, request: RedrawRequest, user_id: str | None = 
 @router.post("/api/characters/{character_id}/emotions")
 def draw_emotions(character_id: str, request: RedrawRequest, user_id: str | None = Depends(require_user)) -> dict:
     folder = _character_dir(user_id, character_id)
+    use_quota(user_id, "drawings")
     with _drawing(folder):
         record = _read(folder)
         if not record.get("sheet"):

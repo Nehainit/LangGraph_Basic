@@ -1,4 +1,4 @@
-import { authHeaders, goToSignIn, loadClerk } from './auth.js';
+import { authHeaders, ensureAccess, goToSignIn, loadClerk } from './auth.js';
 import { mentionedCharacters, setupMentions } from './mentions.js';
 import { setupWriter } from './writer.js';
 import { setupEdits } from './edits.js';
@@ -1143,6 +1143,7 @@ window.addEventListener('beforeunload', event => {
     return;
   }
   if (clerk) clerk.mountUserButton($('#userButton'));
+  if (!(await ensureAccess(clerk))) return;
   await Promise.all([loadCatalog(), loadBilling()]);
   returnFromCheckout();
   // Every session starts on fal.ai (Magnific is only the backend fallback), so the platform is not restored.

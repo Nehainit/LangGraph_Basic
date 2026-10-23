@@ -7,6 +7,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 outputs/
+# Daily spending log for the studio's spending cap.
+data/spend/
 /raja-and-*/
 frontend/*.mp4
 .claim-flow-work/

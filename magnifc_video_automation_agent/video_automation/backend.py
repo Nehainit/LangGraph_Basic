@@ -27,6 +27,7 @@ from video_automation.agents.video_validator import validate_generated_videos
 from video_automation.artifact_store import archive_artifacts
 from video_automation.cost_control import spend_summary
 from video_automation.auth import public_auth_config, require_user
+from video_automation.guard import owns, owner_of, require_owner, spent_today, daily_limit_usd, use_quota
 from video_automation.billing import film_seconds, hold_film, release_film, require_film_allowance, router as billing_router, settle_film
 from video_automation.character_library import film_characters, router as character_router, saved_character_names
 from video_automation.drafts import find_draft, forget_film, record_film, router as drafts_router
@@ -540,6 +541,7 @@ def _resume_review(thread_id: str, node: str, command: dict, user_id: str | None
     config = {"configurable": {"thread_id": thread_id}}
     try:
         snapshot = graph.get_state(config)
+        require_owner(user_id, thread_id, snapshot.values)
         # Approving the storyboard starts paid video; a film already past it resumes paid work.
         if (node == "review_visual_storyboard" and command.get("action") == "approve") or snapshot.values.get("visual_approved"):
             hold_film(user_id, thread_id, film_seconds(snapshot.values.get("duration")))
@@ -571,7 +573,7 @@ def _resume_review(thread_id: str, node: str, command: dict, user_id: str | None
         raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
 
 
-def _selected_feedback(thread_id: str, node: str, feedback: list[ShotFeedback]) -> list[dict[str, str]]:
+def _selected_feedback(thread_id: str, node: str, feedback: list[ShotFeedback], user_id: str | None = None) -> list[dict[str, str]]:
     cleaned = [{"shot_id": item.shot_id.strip(), "note": item.note.strip()} for item in feedback if item.note.strip()]
     if not cleaned:
         raise HTTPException(status_code=400, detail="Add feedback to at least one shot.")
@@ -580,6 +582,7 @@ def _selected_feedback(thread_id: str, node: str, feedback: list[ShotFeedback]) 
         raise HTTPException(status_code=400, detail="Each shot can have only one feedback note.")
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = graph.get_state(config)
+    require_owner(user_id, thread_id, snapshot.values)
     if node not in snapshot.next:
         raise HTTPException(status_code=404, detail="Review session not found or already completed.")
     known_shots = {shot["shot_id"] for shot in snapshot.values.get("storyboard", snapshot.values.get("director_plan", []))}
@@ -628,6 +631,7 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
     if not request.topic.strip():
         raise HTTPException(status_code=400, detail="Topic is required.")
     require_film_allowance(user_id, request.duration)
+    use_quota(user_id, "films")
     cast = film_characters(user_id, request.character_ids)
     topic = request.topic.strip()
     for character in cast:
@@ -646,6 +650,8 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
         result = graph.invoke(
             {
                 "thread_id": thread_id,
+                # The account that made the film; other accounts cannot review, edit, or view it.
+                **({"owner_id": user_id} if user_id else {}),
                 "topic": topic,
                 "tone": "Infer the tone and visual style from the user's prompt.",
                 "duration": f"{request.duration} seconds",
@@ -684,6 +690,7 @@ def create_video(request: VideoRequest, user_id: str | None = Depends(require_us
 def story_writer(request: StoryWriterRequest, user_id: str | None = Depends(require_user)) -> dict:
     if request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="The last message must be yours.")
+    use_quota(user_id, "story_messages")
     try:
         result = write_story(
             [message.model_dump() for message in request.messages],
@@ -753,7 +760,7 @@ def submit_shot_plan_review(request: ShotPlanReviewRequest, user_id: str | None 
 def submit_director_review(request: DirectorReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
-        command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_director_plan", request.feedback)
+        command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_director_plan", request.feedback, user_id)
     return _resume_review(request.thread_id.strip(), "review_director_plan", command, user_id)
 
 
@@ -761,17 +768,25 @@ def submit_director_review(request: DirectorReviewRequest, user_id: str | None =
 def submit_visual_storyboard_review(request: VisualStoryboardReviewRequest, user_id: str | None = Depends(require_user)) -> dict:
     command = {"action": request.action}
     if request.action == "regenerate":
-        command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_visual_storyboard", request.feedback)
+        command["feedback"] = _selected_feedback(request.thread_id.strip(), "review_visual_storyboard", request.feedback, user_id)
     elif request.video_tiers:
         command["video_tiers"] = request.video_tiers
     return _resume_review(request.thread_id.strip(), "review_visual_storyboard", command, user_id)
 
 
-def _finished_film(thread_id: str) -> dict:
+def _finished_film(thread_id: str, user_id: str | None) -> dict:
     snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
     if not snapshot.values or snapshot.next or not snapshot.values.get("video_file"):
         raise HTTPException(status_code=404, detail="Finished film not found.")
+    require_owner(user_id, thread_id, snapshot.values)
     return snapshot.values
+
+
+@app.get("/api/me")
+def me(user_id: str | None = Depends(require_user)) -> dict:
+    """Whether this account may use the studio; uninvited accounts get 403 from require_user."""
+    limit = daily_limit_usd()
+    return {"user_id": user_id, "spent_today_usd": round(spent_today(), 2), "daily_limit_usd": limit}
 
 
 @app.get("/api/sounds", dependencies=[Depends(require_user)])
@@ -788,35 +803,37 @@ def sound(sound_id: str) -> FileResponse:
 def edits_films(known: str = "", user_id: str | None = Depends(require_user)) -> dict:
     """The Edits tab's films: every finished film this account has made, newest first.
 
-    `known` lists films this browser remembers from before films were kept on the server; finished ones are added.
+    `known` lists films this browser remembers from before films were kept on the server; finished ones that no
+    other account owns are added.
     """
     claimed = []
     for thread_id in [item.strip() for item in known.split(",") if item.strip()][:100]:
         snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
-        if snapshot.values and not snapshot.next and snapshot.values.get("video_file"):
+        values = snapshot.values
+        if values and not snapshot.next and values.get("video_file") and values.get("owner_id") in (None, user_id):
             claimed.append(thread_id)
     films = []
     for thread_id in remember_films(user_id, claimed):
         values = graph.get_state({"configurable": {"thread_id": thread_id}}).values
-        if values and editable(values):
+        if values and editable(values) and owns(user_id, thread_id, values):
             films.append(film_card(values, thread_id, _output_url))
     return {"films": films}
 
 
-@app.get("/api/films/{thread_id}/edits", dependencies=[Depends(require_user)])
-def film_edits(thread_id: str) -> dict:
-    return editor_payload(_finished_film(thread_id), _output_url)
+@app.get("/api/films/{thread_id}/edits")
+def film_edits(thread_id: str, user_id: str | None = Depends(require_user)) -> dict:
+    return editor_payload(_finished_film(thread_id, user_id), _output_url)
 
 
-@app.put("/api/films/{thread_id}/edits", dependencies=[Depends(require_user)])
-def autosave_film_edits(thread_id: str, edits: FilmEdits) -> dict:
-    return save_draft(_finished_film(thread_id), edits)
+@app.put("/api/films/{thread_id}/edits")
+def autosave_film_edits(thread_id: str, edits: FilmEdits, user_id: str | None = Depends(require_user)) -> dict:
+    return save_draft(_finished_film(thread_id, user_id), edits)
 
 
 @app.post("/api/films/{thread_id}/edits")
 def export_film_edits(thread_id: str, edits: FilmEdits, user_id: str | None = Depends(require_user)) -> dict:
     """Render the edit with FFmpeg as the film's next version; the original film is kept."""
-    values = _finished_film(thread_id)
+    values = _finished_film(thread_id, user_id)
     try:
         result = render_edit(values, edits)
     except HTTPException:
@@ -828,10 +845,10 @@ def export_film_edits(thread_id: str, edits: FilmEdits, user_id: str | None = De
     return {"version": result["version"], "video_url": _output_url(result["video_file"])}
 
 
-@app.post("/api/films/{thread_id}/voiceovers", dependencies=[Depends(require_user)])
-async def upload_voiceover(thread_id: str, request: Request) -> dict:
+@app.post("/api/films/{thread_id}/voiceovers")
+async def upload_voiceover(thread_id: str, request: Request, user_id: str | None = Depends(require_user)) -> dict:
     """Store a voiceover recorded in the editor; the edit places it on the film's clock."""
-    values = _finished_film(thread_id)
+    values = _finished_film(thread_id, user_id)
     data = await request.body()
     result = save_voiceover(values, data, request.headers.get("content-type", ""))
     return {"id": result["id"], "seconds": result["seconds"], "url": _output_url(result["file"])}
@@ -843,6 +860,7 @@ def create_series(request: StartSeries, user_id: str | None = Depends(require_us
     snapshot = graph.get_state({"configurable": {"thread_id": request.thread_id}})
     if not snapshot.values or snapshot.next:
         raise HTTPException(status_code=409, detail="Only a finished film can start a series.")
+    require_owner(user_id, request.thread_id, snapshot.values)
     return start_series(user_id, request.thread_id, snapshot.values, _output_url(snapshot.values.get("video_file")), request.title)
 
 
@@ -861,14 +879,19 @@ def reopen_paused_film(draft_id: str, user_id: str | None = Depends(require_user
     return {**response, "request": draft["request"]}
 
 
-@app.get("/output/{path:path}", dependencies=[Depends(require_user)])
-def output_file(path: str) -> FileResponse:
+@app.get("/output/{path:path}")
+def output_file(path: str, user_id: str | None = Depends(require_user)) -> FileResponse:
     file_path = (ROOT / path).resolve()
     try:
-        file_path.relative_to((ROOT / "outputs").resolve())
+        relative = file_path.relative_to((ROOT / "outputs").resolve())
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="File not found.") from exc
     if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found.")
+    # Every file of a film lives under outputs/<thread id>/; only the account that made the film can load it.
+    thread_id = relative.parts[0] if relative.parts else ""
+    owner = owner_of(thread_id, lambda thread: graph.get_state({"configurable": {"thread_id": thread}}).values)
+    if not owns(user_id, thread_id, {"owner_id": owner}):
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(file_path)
 

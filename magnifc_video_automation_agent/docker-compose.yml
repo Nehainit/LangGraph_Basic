@@ -5,6 +5,10 @@ services:
     env_file: .env
     environment:
       CHECKPOINT_DB: /app/state/langgraph-checkpoints.sqlite
+      # A deployed studio never runs open: a missing Clerk key locks the API instead.
+      REQUIRE_SIGN_IN: "true"
+      # The daily spending log lives on the mounted volume, so a restart does not reset the cap.
+      SPEND_DIR: /app/state/spend
     volumes:
       - ./outputs:/app/outputs
       - ./library:/app/library

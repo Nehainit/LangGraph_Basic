@@ -58,7 +58,7 @@ def test_web_story_then_visual_storyboard_flow(monkeypatch):
     fake_graph = FakeGraph()
     backend.graph = fake_graph
     try:
-        response = backend.create_video(backend.VideoRequest(topic="A funny story about Mira", duration=47, language="Hindi"))
+        response = backend.create_video(backend.VideoRequest(topic="A funny story about Mira", duration=47, language="Hindi"), user_id=None)
         assert response["status"] == "visual_storyboard_review"
         assert response["image_urls"] == ["/output/outputs/test/images/shot-001.png"]
         assert [command.resume for command in fake_graph.commands] == [{"action": "approve", "note": ""}]
@@ -70,7 +70,7 @@ def test_web_story_then_visual_storyboard_flow(monkeypatch):
         assert fake_graph.initial_state["image_provider"] == "fal"
 
         response = backend.submit_visual_storyboard_review(
-            backend.VisualStoryboardReviewRequest(thread_id=response["thread_id"], action="approve")
+            backend.VisualStoryboardReviewRequest(thread_id=response["thread_id"], action="approve"), user_id=None
         )
         assert response["status"] == "complete"
         assert response["warnings"] == ["local fallback"]
@@ -115,7 +115,7 @@ def test_storyboard_approval_auto_answers_later_internal_checkpoints():
     backend.graph = fake_graph
     try:
         response = backend.submit_visual_storyboard_review(
-            backend.VisualStoryboardReviewRequest(thread_id="thread", action="approve")
+            backend.VisualStoryboardReviewRequest(thread_id="thread", action="approve"), user_id=None
         )
     finally:
         backend.graph = original_graph
@@ -155,7 +155,7 @@ def test_web_request_stops_repeating_the_same_review(monkeypatch):
     fake_graph = LoopingReviewGraph()
     backend.graph = fake_graph
     try:
-        response = backend.create_video(backend.VideoRequest(topic="A story"))
+        response = backend.create_video(backend.VideoRequest(topic="A story"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -185,7 +185,7 @@ def test_web_request_stops_repeating_story_review(monkeypatch):
     fake_graph = LoopingStoryGraph()
     backend.graph = fake_graph
     try:
-        response = backend.create_video(backend.VideoRequest(topic="A story"))
+        response = backend.create_video(backend.VideoRequest(topic="A story"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -229,7 +229,7 @@ def test_web_request_recovers_scene_plan_upstream_and_continues(monkeypatch):
     fake_graph = RecoveringGraph()
     backend.graph = fake_graph
     try:
-        response = backend.create_video(backend.VideoRequest(topic="A three-scene story"))
+        response = backend.create_video(backend.VideoRequest(topic="A three-scene story"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -266,7 +266,7 @@ def test_selected_image_provider_is_passed_to_graph():
     fake_graph = FakeGraph()
     backend.graph = fake_graph
     try:
-        backend.create_video(backend.VideoRequest(topic="A story", image_provider="fal"))
+        backend.create_video(backend.VideoRequest(topic="A story", image_provider="fal"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -280,9 +280,9 @@ def test_selected_visual_style_is_passed_to_graph_as_explicit_style():
     fake_graph = FakeGraph()
     backend.graph = fake_graph
     try:
-        backend.create_video(backend.VideoRequest(topic="A story"))
+        backend.create_video(backend.VideoRequest(topic="A story"), user_id=None)
         assert "visual_style" not in fake_graph.initial_state
-        backend.create_video(backend.VideoRequest(topic="A story", visual_style="anime"))
+        backend.create_video(backend.VideoRequest(topic="A story", visual_style="anime"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -303,7 +303,7 @@ def test_model_catalog_and_independent_selection():
         backend.create_video(backend.VideoRequest(
             topic="A story", narration_model="eleven_multilingual_v2",
             image_model="fal-ai/nano-banana-pro", video_model="kling-v2-6-pro",
-        ))
+        ), user_id=None)
     finally:
         backend.graph = original_graph
     assert fake_graph.initial_state["narration_model"] == "eleven_multilingual_v2"
@@ -348,7 +348,7 @@ def test_unsafe_request_returns_bad_request(monkeypatch):
     backend.graph = UnsafeGraph()
     try:
         try:
-            backend.create_video(backend.VideoRequest(topic="Unsafe request"))
+            backend.create_video(backend.VideoRequest(topic="Unsafe request"), user_id=None)
         except Exception as exc:
             assert exc.status_code == 400
             assert exc.detail["categories"] == ["self_harm"]
@@ -425,7 +425,7 @@ def test_video_request_requires_vision_model(monkeypatch):
         lambda _agent: (_ for _ in ()).throw(RuntimeError("Vision model is unavailable.")),
     )
     try:
-        backend.create_video(backend.VideoRequest(topic="A story"))
+        backend.create_video(backend.VideoRequest(topic="A story"), user_id=None)
     except Exception as exc:
         assert exc.status_code == 400
         return
@@ -441,15 +441,15 @@ def test_output_endpoint_serves_only_generated_artifacts(monkeypatch, tmp_path):
     secret.write_text("SECRET=value")
     monkeypatch.setattr(backend, "ROOT", tmp_path)
 
-    assert backend.output_file("outputs/video.mp4").path == video
+    assert backend.output_file("outputs/video.mp4", user_id=None).path == video
     with pytest.raises(backend.HTTPException) as error:
-        backend.output_file(".env")
+        backend.output_file(".env", user_id=None)
     assert error.value.status_code == 404
 
 
 def test_story_regeneration_requires_feedback():
     try:
-        backend.submit_story_review(backend.StoryReviewRequest(thread_id="thread", action="regenerate", note=" "))
+        backend.submit_story_review(backend.StoryReviewRequest(thread_id="thread", action="regenerate", note=" "), user_id=None)
     except Exception as exc:
         assert exc.status_code == 400
         return
@@ -472,7 +472,7 @@ def test_approve_retries_failed_downstream_node():
     failed_graph = FailedGraph()
     backend.graph = failed_graph
     try:
-        response = backend.submit_story_review(backend.StoryReviewRequest(thread_id="thread", action="approve"))
+        response = backend.submit_story_review(backend.StoryReviewRequest(thread_id="thread", action="approve"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -501,7 +501,7 @@ def test_retrying_a_review_resumes_a_step_that_crashed_after_it():
     crashed = CrashedGraph()
     backend.graph = crashed
     try:
-        backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"))
+        backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"), user_id=None)
     finally:
         backend.graph = original_graph
 
@@ -517,7 +517,7 @@ def test_review_of_a_finished_run_is_still_not_found():
     backend.graph = FinishedGraph()
     try:
         with pytest.raises(backend.HTTPException) as error:
-            backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"))
+            backend.submit_shot_plan_review(backend.ShotPlanReviewRequest(thread_id="thread", action="retry"), user_id=None)
     finally:
         backend.graph = original_graph
 

@@ -78,11 +78,18 @@ class CostLedger:
                     f"Budget of ${float(cap):.2f} per video reached (${spent:.2f} spent); "
                     f"{stage} for {item} (${usd:.2f}) was not started."
                 )
+            # Every film also counts toward the studio's daily cap across all accounts.
+            from video_automation.guard import charge_today
+
+            charge_today(key, usd)
             self._entries[key] = {"key": key, "stage": stage, "item": item, "usd": round(usd, 6), **details}
 
     def refund(self, key: str) -> None:
+        from video_automation.guard import refund_today
+
         with self._lock:
-            self._entries.pop(key, None)
+            if self._entries.pop(key, None) is not None:
+                refund_today(key)
 
     def snapshot(self) -> list[dict]:
         with self._lock:

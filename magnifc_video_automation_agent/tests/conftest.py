@@ -19,3 +19,7 @@ def _private_library(monkeypatch, tmp_path):
     from video_automation import character_library
 
     monkeypatch.setattr(character_library, "LIBRARY_ROOT", tmp_path / "library")
+    # The daily spending log and the security settings start empty for every test.
+    monkeypatch.setenv("SPEND_DIR", str(tmp_path / "spend"))
+    for name in ("REQUIRE_SIGN_IN", "ALLOWED_USERS", "DAILY_SPEND_LIMIT_USD", "CLERK_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)

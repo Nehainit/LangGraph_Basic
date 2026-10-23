@@ -116,6 +116,9 @@ pipeline:
     min_speech_seconds: 0.4
 
   budget:
+    # Paid calls across every account stop for the rest of the UTC day once this much is spent (0 = no cap).
+    # DAILY_SPEND_LIMIT_USD in the environment overrides it.
+    max_usd_per_day: 20.0
     # Paid calls stop once a video would cost more than this. Redos then keep the best result so far
     # (or free FFmpeg camera motion for video); a first-time image that cannot be afforded stops the run.
     max_usd_per_video: 5.0
